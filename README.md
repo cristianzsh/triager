@@ -4,6 +4,10 @@
 
 The tool is designed to work against **triage collections** (e.g., obtained via `KAPE` or `Velociraptor`).
 
+<p align="center">
+    <img src="images/screenshot_main.png"/>
+</p>
+
 # Motivation
 
 DFIR investigations rely on a large number of forensic artifacts, each requiring specialized tools, formats, and interpretation. Manually parsing these artifacts is time-consuming. With this in mind, `Triager` was created to:
@@ -176,7 +180,17 @@ python3 triager.py -d out_dir --search "schtasks" --search-max-hits 50
 python3 triager.py -d out_dir --find-iocs iocs.txt
 ```
 
+Results of searching for PsExec in the processed output:
+
+<p align="center">
+    <img src="images/screenshot_search.png"/>
+</p>
+
 ## Current output structure:
+
+<p align="center">
+    <img src="images/output_structure.png"/>
+</p>
 
 ```
 +---Event logs
