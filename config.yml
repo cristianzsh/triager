@@ -1,0 +1,35 @@
+root: "D:\\cases\\sample_001\\cape_triage"
+
+# Core Windows paths (relative to triage root)
+System32: "uploads\\auto\\C%3A\\Windows\\System32"
+EventLogs: "uploads\\auto\\C%3A\\Windows\\System32\\winevt\\Logs"
+ScheduledTasks: "uploads\\auto\\C%3A\\Windows\\System32\\Tasks"
+Prefetch: "uploads\\auto\\C%3A\\Windows\\Prefetch"
+AmCache: "uploads\\auto\\C%3A\\Windows\\AppCompat\\Programs\\Amcache.hve"
+PCA: "uploads\\auto\\C%3A\\Windows\\AppCompat\\pca"
+WER: "uploads\\auto\\C%3A\\ProgramData\\Microsoft\\Windows\\WER"
+WindowsDefenderLogs: "uploads\\auto\\C%3A\\ProgramData\\Microsoft\\Windows Defender\\Support"
+SRUM: "uploads\\auto\\C%3A\\Windows\\System32\\sru\\SRUDB.dat"
+WMI: "uploads\\auto\\C%3A\\Windows\\System32\\wbem\\Repository\\OBJECTS.DATA"
+
+# If present in the triage (depends on how it was collected)
+RecycleBin: "uploads\\auto\\C%3A\\$Recycle.Bin"
+USNJournal: "uploads\\ntfs\\%5C%5C.%5CC%3A\\$Extend\\$UsnJrnl%3A$J"
+MFT: "uploads\\ntfs\\%5C%5C.%5CC%3A\\$MFT"
+LogFile: "uploads\\ntfs\\%5C%5C.%5CC%3A\\$LogFile"
+
+# Users root in triage
+Users: "uploads\\auto\\C%3A\\Users"
+
+# Registry hives
+RegistryHives:
+  SYSTEM: "uploads\\auto\\C%3A\\Windows\\System32\\config\\SYSTEM"
+  SOFTWARE: "uploads\\auto\\C%3A\\Windows\\System32\\config\\SOFTWARE"
+  SAM: "uploads\\auto\\C%3A\\Windows\\System32\\config\\SAM"
+  SECURITY: "uploads\\auto\\C%3A\\Windows\\System32\\config\\SECURITY"
+  DEFAULT: "uploads\\auto\\C%3A\\Windows\\System32\\config\\DEFAULT"
+
+# Per-user hives patterns
+UserHives:
+  NTUSERGlob: "Users\\*\\NTUSER.DAT"
+  USRCLASSGlob: "Users\\*\\AppData\\Local\\Microsoft\\Windows\\UsrClass.dat"

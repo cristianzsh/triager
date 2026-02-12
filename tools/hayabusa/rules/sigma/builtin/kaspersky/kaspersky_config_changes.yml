@@ -1,0 +1,32 @@
+title: Kaspersky Configuration Change
+id: c891b0e7-91a1-41a9-9f24-918bbf105cdc
+status: experimental
+description: |
+  Detects application or component configuration changes in KES.
+  Focuses on Event ID 218 and unstructured logs referencing .exe files and subsystem/module changes.
+
+author: Cristian Souza
+date: 2025-07-24
+modified: 2025-07-24
+level: medium
+logsource:
+  product: windows
+detection:
+  selection:
+    EventID: 218
+    Provider_Name: 'avp'
+    Data|contains:
+      - '.exe'
+      - 'Program Files'
+      - 'Lab'
+  condition: selection
+falsepositives:
+  - Legitimate Kaspersky module changes
+tags:
+  - kaspersky
+  - configuration_change
+  - endpoint_security
+  - evtx
+  - tampering
+ruletype: Sigma
+engine: k-evtrace

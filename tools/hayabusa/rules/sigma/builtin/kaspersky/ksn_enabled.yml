@@ -1,0 +1,34 @@
+title: Kaspersky Security Network Enabled
+id: cc84e7f0-dd01-42dc-b5dc-fc668f22ce43
+status: experimental
+description: |
+  Detects status changes in Kaspersky Security Network (KSN) participation.
+  Event IDs 2071 and 2073 are triggered when KSN is enabled.
+
+author: Cristian Souza
+date: 2025-07-24
+modified: 2025-07-24
+level: low
+logsource:
+  product: windows
+detection:
+  selection:
+    EventID:
+      - 2071
+      - 2073
+    Provider_Name: 'avp'
+    Channel: 'Kaspersky Endpoint Security'
+  context_match:
+    Data|contains:
+      - 'Kaspersky'
+      - 'Security'
+      - 'Network'
+  condition: selection and context_match
+tags:
+  - kaspersky
+  - ksn
+  - evtx
+  - endpoint_security
+  - configuration_change
+ruletype: Sigma
+engine: k-evtrace

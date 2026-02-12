@@ -1,0 +1,43 @@
+# Ransomware names
+LB3.exe
+Lockbit
+
+# Suspicious files/names
+PsExec
+PSEXESVC
+svhost
+scvhost
+svhosts
+123.exe
+mimikatz
+haz8.exe
+
+# AV verdicts
+Trojan.Win32.Generic
+Trojan-Dropper.Win32.Agent
+Trojan-Ransom.Win32.Generic
+Trojan-Ransom.Win32.Agent
+Trojan-Ransom.Win32.Lockbit
+Trojan.Multi.Crypmod.gen
+HackTool.PowerShell.Agent
+
+# Strings
+Invoke-WebRequest
+powershell -enc
+frombase64string
+ransom
+
+# Hashes
+82ed942a52cdcf120a8919730e00ba37619661a3
+f02daf614109f39babdcb6f8841dd6981e929d70
+c0979ec20b87084317d1bfa50405f7149c3b5c5f
+eff7919d5de737d9a64f7528e86e3666051a49aa
+0a15be464a603b1eebc61744dc60510ce169e135
+d5a050c73346f01fc9ad767d345ed36c221baac2
+987834891cea821bcd3ce1f6d3e549282d38b8d3
+86a2a93a31e0151888c52dbbc8e33a7a3f4357db
+dcaed7526cda644a23da542d01017d48d97c9533
+61f73e692e9549ad8bc9b965e25d2da683d56dc1
+8af05099986d0b105d8e38f305efe9098a9fbda6
+3648359ebae8ce7cacae1e631103659f5a8c630e
+fe6de75d6042de714c28c0a3c0816b37e0fa4bb3

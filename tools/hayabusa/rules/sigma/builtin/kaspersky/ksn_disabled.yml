@@ -1,0 +1,36 @@
+title: Kaspersky Security Network Disabled
+id: a7459e33-6b3a-4e48-a274-dc570e688fa9
+status: experimental
+description: |
+  Detects status changes in Kaspersky Security Network (KSN) participation.
+  Event IDs 2072 and 2076 are triggered when KSN is disabled.
+
+author: Cristian Souza
+date: 2025-07-24
+modified: 2025-07-24
+level: medium
+logsource:
+  product: windows
+detection:
+  selection:
+    EventID:
+      - 2072
+      - 2076
+    Provider_Name: 'avp'
+    Channel: 'Kaspersky Endpoint Security'
+  context_match:
+    Data|contains:
+      - 'Kaspersky'
+      - 'Security'
+      - 'Network'
+  condition: selection and context_match
+falsepositives:
+  - Admin policy enforcement disabling KSN
+tags:
+  - kaspersky
+  - ksn
+  - evtx
+  - endpoint_security
+  - configuration_change
+ruletype: Sigma
+engine: k-evtrace

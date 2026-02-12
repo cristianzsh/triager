@@ -1,0 +1,33 @@
+title: Kaspersky Real-Time File Protection Event
+id: c5b71e8e-0c55-4703-9a7e-fb4d89bfc1da
+status: experimental
+description: |
+  Detects activity from Kaspersky Real-Time File Protection module.
+  Event IDs 6032, 6040.
+
+author: Cristian Souza
+date: 2025-07-25
+modified: 2025-07-25
+level: medium
+logsource:
+  product: windows
+  service: 'Kaspersky Security'
+detection:
+  selection:
+    Provider_Name: 'Real-Time File Protection'
+    EventID:
+      - 6032
+      - 6040
+    Channel: 'Kaspersky Security'
+  condition: selection
+falsepositives:
+  - Normal file scanning operations
+  - Legitimate software installation or updates
+tags:
+  - kaspersky
+  - evtx
+  - realtime_protection
+  - endpoint_security
+  - file_monitoring
+ruletype: Sigma
+engine: k-evtrace

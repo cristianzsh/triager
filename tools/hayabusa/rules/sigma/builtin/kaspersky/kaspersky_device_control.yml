@@ -1,0 +1,31 @@
+title: Kaspersky Device Control
+id: b2f7fd57-d3ff-41a5-91c5-168ca0483f26
+status: experimental
+description: |
+  Detects device control activity logged by Kaspersky Endpoint Security.
+  Event ID 7610 from the Device Control module.
+
+author: Cristian Souza
+date: 2025-07-25
+modified: 2025-07-25
+level: low
+logsource:
+  product: windows
+  service: 'Kaspersky Security'
+detection:
+  selection:
+    EventID: 7610
+    Provider_Name: 'Device Control'
+    Channel: 'Kaspersky Security'
+  condition: selection
+falsepositives:
+  - Legitimate use of authorized USB or biometric devices
+tags:
+  - kaspersky
+  - evtx
+  - device_control
+  - usb
+  - hardware
+  - endpoint_security
+ruletype: Sigma
+engine: k-evtrace

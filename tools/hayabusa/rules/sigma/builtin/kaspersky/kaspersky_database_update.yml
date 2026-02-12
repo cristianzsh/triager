@@ -1,0 +1,33 @@
+title: Kaspersky Database Update
+id: 7d2aa47e-0a8e-42bb-9e76-3e7d601aa16e
+status: experimental
+description: |
+  Detects when Kaspersky performs a database update operation.
+  This rule is based solely on Event ID 6204.
+
+author: Cristian Souza
+date: 2025-07-25
+modified: 2025-07-25
+level: informational
+logsource:
+  product: windows
+  service: 'Kaspersky Security'
+detection:
+  selection:
+    EventID:
+      - 6204
+      - 6208
+      - 6209
+    Provider_Name: 'Updates'
+    Channel: 'Kaspersky Security'
+  condition: selection
+falsepositives:
+  - Normal scheduled signature or module updates
+tags:
+  - kaspersky
+  - evtx
+  - updates
+  - database_update
+  - endpoint_security
+ruletype: Sigma
+engine: k-evtrace

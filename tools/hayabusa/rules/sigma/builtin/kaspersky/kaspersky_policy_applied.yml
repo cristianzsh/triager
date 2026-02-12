@@ -1,0 +1,30 @@
+title: Kaspersky Group Policy Applied
+id: e905e2e4-3c3f-4630-bd7f-3967b185ef82
+status: experimental
+description: |
+  Detects when a Group Policy is applied to the Kaspersky Endpoint Security service or modules.
+  Based on Event ID 219 from the 'avp' provider.
+
+author: Cristian Souza
+date: 2025-07-24
+modified: 2025-07-24
+level: informational
+logsource:
+  product: windows
+  service: 'Kaspersky Endpoint Security'
+detection:
+  selection:
+    Provider_Name: 'avp'
+    EventID: 219
+    Channel: 'Kaspersky Endpoint Security'
+  condition: selection
+falsepositives:
+  - Legitimate and scheduled Group Policy updates
+tags:
+  - kaspersky
+  - group_policy
+  - evtx
+  - configuration_change
+  - endpoint_security
+ruletype: Sigma
+engine: k-evtrace

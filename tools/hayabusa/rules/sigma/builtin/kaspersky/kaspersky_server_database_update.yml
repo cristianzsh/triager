@@ -1,0 +1,33 @@
+title: Kaspersky Server Database Update
+id: 4c911289-8dd6-4b14-a7e8-13f0db5df4b0
+status: experimental
+description: |
+  Detects when the Kaspersky server performs a database update.
+  Event ID 6203.
+
+author: Cristian Souza
+date: 2025-07-25
+modified: 2025-07-25
+level: informational
+logsource:
+  product: windows
+  service: 'Kaspersky Security'
+detection:
+  selection:
+    EventID:
+      - 6203
+      - 6717
+    Provider_Name: 'Updates'
+    Channel: 'Kaspersky Security'
+  condition: selection
+falsepositives:
+  - Scheduled update tasks
+  - Manual signature downloads
+tags:
+  - kaspersky
+  - evtx
+  - database_update
+  - updates
+  - endpoint_security
+ruletype: Sigma
+engine: k-evtrace
