@@ -1714,7 +1714,7 @@ def parse_browser_history(artifact_paths: PathMap, outdirs: dict[str, Path]) -> 
         "/HistorySource", "3",
         "/HistorySourceFolder", str(users_dir),
         "/VisitTimeFilterType", "1",
-        "/ShowTimeInGMT", "0",
+        "/ShowTimeInGMT", "1",
         "/scomma", str(out_csv),
     ]
     run_cmd(cmd1, tool_out / "stdout.log", tool_out / "stderr.log", check=False)
