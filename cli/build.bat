@@ -51,6 +51,7 @@ pyinstaller --clean --onefile ^
             --distpath "%DIST_DIR%" ^
             --hidden-import=Registry ^
             --collect-all=pyyaml ^
+            --icon=triager.ico ^
             %ADD_DATA% ^
             "%SCRIPT%"
 
