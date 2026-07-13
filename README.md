@@ -2,7 +2,7 @@
 
 `Triager` is a Python-based DFIR automation tool designed to automatically parse Windows forensic artifacts collected during incident response and post-incident investigations. Instead of manually running dozens of tools and parsing heterogeneous outputs, `Triager` orchestrates evidence extraction, invokes well-known forensic utilities, normalizes results into CSV format, and organizes findings in a consistent investigation-ready layout.
 
-The tool is designed to work against **triage collections** (e.g., obtained via `KAPE` or `Velociraptor`).
+The tool is designed to work against **triage collections** (e.g., obtained via `KAPE`, `Aralez`, or `Velociraptor`).
 
 <p align="center">
     <img src="images/screenshot_main.png"/>
@@ -16,7 +16,6 @@ DFIR investigations rely on a large number of forensic artifacts, each requiring
 * Reduce analyst investigation time
 * Enforce consistent artifact handling and output structure
 * Enable faster pivoting, searching, and correlation across artifacts
-* Support assisted AI post-processing
 
 The tool focuses on **orchestration**, not reinventing parsers. Whenever possible, it leverages established forensic tools and normalizes their outputs.
 
@@ -56,7 +55,7 @@ Below is a high-level summary of the main artifacts handled by `Triager`:
 * Required Python packages:
 
   ```bash
-  pip install pyyaml python-registry requests
+  pip install pyyaml python-registry
   ```
 
 ### External tools
@@ -76,9 +75,9 @@ Triager relies on multiple external forensic tools, expected to be placed under 
 * AmcacheParser
 * UserAssistReport
 
-# config.yml
+# .yml configuration
 
-You will need to adjust the `config.yml` file according to your needs. It should specify the locations of the forensic artifacts within the target directory or ZIP file. The default is:
+You will need to specify the `.yml` configuration file according to your needs. It should specify the locations of the forensic artifacts within the target directory or ZIP file. The default is Velociraptor:
 
 ```
 root: "D:\\cases\\sample_001\\cape_triage"
@@ -123,7 +122,7 @@ UserHives:
 Basic processing:
 
 ```bash
-python3 triager.py --root triage_collection.zip -o output_directory
+python3 triager.py --root triage_collection --output output_directory
 ```
 
 Using a ZIP triage archive and custom config file:
@@ -150,31 +149,10 @@ python3 triager.py -d output_directory --find-iocs iocs.txt
 python3 triager.py -d output_directory --find-iocs iocs.txt --save-iocs iocs_dir
 ```
 
-Generate AI-assisted forensic report:
-
-```bash
-$env:OPENAI_API_KEY="your_api_key" # Windows
-export OPENAI_API_KEY="your_api_key" # Linux
-
-python3 triager.py -d output_directory --ai
-```
-
-This produces `ai_forensic_report.md` inside the output directory. If the API key is set, `Triager` will query OpenAI. If not, the report will contain only the data that can be pasted into a LLM.
-
-**Use this with caution to not expose sensitive information.**
-
-The generated report includes:
-
-* Executive summary
-* Suspected activity timeline
-* Suspicious commands, binaries, and paths
-* Persistence mechanisms
-* Recommended investigative next steps
-
 ## Typical workflow example
 
 ```bash
-python3 triager.py --config config.yml --root /mnt/triage_dir --output out_dir
+python3 triager.py --config config.yml --root /mnt/triage_dir --output out_dir --zip-output
 
 python3 triager.py -d out_dir --search "schtasks" --search-max-hits 50
 python3 triager.py -d out_dir --find-iocs iocs.txt
@@ -238,12 +216,7 @@ Results of searching for PsExec in the processed output:
 
 # Building executables
 
-A `build.sh` script is provided to generate standalone binaries for both Linux and Windows (via Wine).
-
-```bash
-chmod +x build.sh
-./build.sh
-```
+A `build.bat` script is provided to generate a standalone binary for Windows.
 
 # License
 

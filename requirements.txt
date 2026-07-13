@@ -1,3 +1,0 @@
-python-registry
-pyyaml
-requests
