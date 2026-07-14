@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Triager Console</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+<!-- ---------------- Login ---------------- -->
+<div id="login-screen">
+  <div class="login-card">
+    <h1>Triager Console</h1>
+    <div class="tag">DFIR case &amp; artifact workspace</div>
+    <label>Username</label>
+    <input id="login-username" type="text" autocomplete="username" />
+    <label>Password</label>
+    <input id="login-password" type="password" autocomplete="current-password" />
+    <button class="primary" id="login-btn">Sign in</button>
+    <div class="login-error" id="login-error"></div>
+  </div>
+</div>
+
+<!-- ---------------- App shell ---------------- -->
+<div id="app">
+  <div class="topbar">
+    <div class="brand">TRIAGER<span class="tag">::CONSOLE</span></div>
+    <nav id="top-nav">
+      <button class="tab active" data-view="cases">Cases</button>
+      <button class="tab" data-view="ai-settings">AI Settings</button>
+      <button class="tab" data-view="users" id="nav-users" style="display:none">Users</button>
+      <button class="tab" data-view="global-audit" id="nav-global-audit" style="display:none">Audit Log</button>
+    </nav>
+    <div class="spacer"></div>
+    <div class="who" id="who-am-i"></div>
+    <button id="logout-btn">Sign out</button>
+  </div>
+
+  <div class="body-wrap">
+    <div class="sidebar" id="sidebar" style="display:none"></div>
+    <div class="main" id="main"></div>
+  </div>
+</div>
+
+<script src="vendor/marked.min.js"></script>
+<script src="vendor/purify.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

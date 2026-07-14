@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('tools', 'tools')]
+datas = []
 binaries = []
 hiddenimports = ['Registry']
 tmp_ret = collect_all('pyyaml')
@@ -42,4 +42,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=['triager.ico'],
 )

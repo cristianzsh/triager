@@ -1,0 +1,83 @@
+"""
+Safe ZIP extraction for both evidence collections and pre-processed Triager
+output archives. Ported from Triager's own _extract_zip_to_temp, but writes
+into a stable, case-scoped directory (not a temp dir that gets wiped), and
+extracts in a background thread since evidence archives can be tens of GB.
+"""
+import hashlib
+import os
+import shutil
+import zipfile
+from pathlib import Path
+from typing import Callable, Optional
+
+ILLEGAL_CHARS = set('<>:"/\\|?*')
+
+
+def _sanitize_component(s: str) -> str:
+    s = "".join("_" if (c in ILLEGAL_CHARS or ord(c) < 32) else c for c in s)
+    s = s.strip(" .")
+    return s or "_"
+
+
+def _safe_join(root: Path, rel: str) -> Path:
+    rel = rel.replace("\\", "/")
+    if rel.startswith("/") or rel.startswith("../") or "/../" in rel:
+        raise ValueError(f"Unsafe zip member path: {rel}")
+    parts = [p for p in rel.split("/") if p not in ("", ".")]
+    safe_parts = [_sanitize_component(p) for p in parts]
+    return (root / Path(*safe_parts)).resolve()
+
+
+def _truncate_path(p: Path, max_name: int = 120) -> Path:
+    name = p.name
+    if len(name) <= max_name:
+        return p
+    stem, ext = os.path.splitext(name)
+    h = hashlib.sha1(name.encode("utf-8", errors="ignore")).hexdigest()[:10]
+    keep = max(1, max_name - len(ext) - 11)
+    return p.with_name(f"{stem[:keep]}_{h}{ext}")
+
+
+def extract_zip(
+    zip_path: Path,
+    dest_root: Path,
+    progress_cb: Optional[Callable[[int, int], None]] = None,
+) -> Path:
+    """
+    Extracts zip_path under dest_root. Returns the effective root
+    (unwraps a single top-level directory, matching Triager's own behavior,
+    so config-relative paths like uploads\\auto\\C%3A\\... resolve the
+    same way whether run via web UI or CLI).
+    """
+    if not zipfile.is_zipfile(zip_path):
+        raise ValueError(f"Not a valid zip file: {zip_path}")
+
+    dest_root.mkdir(parents=True, exist_ok=True)
+    warned = 0
+
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        members = [zi for zi in zf.infolist() if not zi.filename.endswith("/")]
+        total = len(members)
+        for i, zi in enumerate(members, 1):
+            raw_name = zi.filename.replace("\\", "/")
+            try:
+                out_path = _safe_join(dest_root, raw_name)
+                out_path = _truncate_path(out_path)
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(zi, "r") as src, out_path.open("wb") as dst:
+                    shutil.copyfileobj(src, dst, length=1024 * 1024)
+            except Exception:
+                warned += 1
+                continue
+            if progress_cb:
+                progress_cb(i, total)
+
+    try:
+        children = [p for p in dest_root.iterdir() if p.name not in (".DS_Store", "__MACOSX")]
+        if len(children) == 1 and children[0].is_dir():
+            return children[0].resolve()
+    except Exception:
+        pass
+
+    return dest_root

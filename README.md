@@ -1,223 +1,213 @@
-# Triager: A DFIR automation script
+# Triager
 
-`Triager` is a Python-based DFIR automation tool designed to automatically parse Windows forensic artifacts collected during incident response and post-incident investigations. Instead of manually running dozens of tools and parsing heterogeneous outputs, `Triager` orchestrates evidence extraction, invokes well-known forensic utilities, normalizes results into CSV format, and organizes findings in a consistent investigation-ready layout.
+`Triager` is a DFIR automation platform for Windows triage collections produced by tools such as `KAPE`, `Velociraptor`, and `Aralez`. It orchestrates forensic utilities, normalizes results into investigation-ready CSV files, and provides two ways to work with the evidence:
 
-The tool is designed to work against **triage collections** (e.g., obtained via `KAPE`, `Aralez`, or `Velociraptor`).
+- **Triager CLI** — parses collections, searches processed results, and scans for IOCs.
+- **Triager Web Console** — adds multi-case and multi-machine investigation management through a browser.
 
-<p align="center">
-    <img src="images/screenshot_main.png"/>
-</p>
-
-# Motivation
-
-DFIR investigations rely on a large number of forensic artifacts, each requiring specialized tools, formats, and interpretation. Manually parsing these artifacts is time-consuming. With this in mind, `Triager` was created to:
-
-* Automate repetitive forensic parsing tasks
-* Reduce analyst investigation time
-* Enforce consistent artifact handling and output structure
-* Enable faster pivoting, searching, and correlation across artifacts
-
-The tool focuses on **orchestration**, not reinventing parsers. Whenever possible, it leverages established forensic tools and normalizes their outputs.
-
-# Forensic artifacts overview
-
-Below is a high-level summary of the main artifacts handled by `Triager`:
-
-* **Event Logs (EVTX)** - Used to reconstruct system, security, and application activity timelines, including authentication events, process creation, and security alerts.
-
-* **Prefetch** - Provides evidence of program execution, execution counts, and last run timestamps for executable files.
-
-* **Amcache** - Tracks binaries and metadata, useful for identifying previously executed malware or suspicious tools.
-
-* **Shimcache (AppCompatCache)** - Records historical execution traces, often useful even when Prefetch is absent.
-
-* **BAM/DAM** - Execution artifacts linked to user activity.
-
-* **SRUM** - Contains application usage, network activity, and resource consumption data.
-
-* **Scheduled Tasks** - Common persistence mechanism used by both legitimate software and malware.
-
-* **WMI Repository** - Frequently abused for stealthy persistence mechanisms.
-
-* **Windows Defender Logs** - Provides detection history, verdicts, and alert metadata.
-
-* **WER (Windows Error Reporting)** - Can reveal crashed or abnormal application executions.
-
-* **MFT, USN Journal, and $LogFile** - File system artifacts used to reconstruct file creation, deletion, renaming, and modification activity.
-
-* **Registry (HKLM / HKCU / NTUSER / UsrClass)** - Source of extensive user activity, execution traces, persistence indicators, and configuration data.
-
-* **User Artifacts** - Includes JumpLists, Recent Files, MRUs, Typed Paths, Browser History, PowerShell history, RDP cache, thumbnails, and timelines.
-
-# Requirements
-
-* Python **3.10+** recommended
-* Required Python packages:
-
-  ```bash
-  pip install pyyaml python-registry
-  ```
-
-### External tools
-
-Triager relies on multiple external forensic tools, expected to be placed under the `tools/` directory. Examples include (but are not limited to):
-
-* PECmd
-* MFTECmd
-* AppCompatCacheParser
-* SBECmd
-* JLECmd
-* EvtxECmd
-* Hayabusa
-* Chainsaw
-* APT-Hunter
-* SrumECmd
-* AmcacheParser
-* UserAssistReport
-
-# .yml configuration
-
-You will need to specify the `.yml` configuration file according to your needs. It should specify the locations of the forensic artifacts within the target directory or ZIP file. The default is Velociraptor:
-
+```text
+cli/    Core parsing and command-line analysis
+web/    Browser-based case-management and investigation workspace
 ```
-root: "D:\\cases\\sample_001\\cape_triage"
 
-# Core Windows paths (relative to triage root)
+`Triager` works with collected artifacts rather than raw disk images. Its purpose is orchestration: specialized parsers remain responsible for artifact extraction, while `Triager` provides a consistent workflow and output structure.
+
+## Main capabilities
+
+### Artifact processing
+
+Triager processes and organizes evidence from:
+
+- Windows Event Logs
+- Prefetch, Amcache, Shimcache, BAM/DAM, and SRUM
+- Scheduled Tasks, WMI, Windows Defender, and WER
+- MFT, USN Journal, $LogFile, and Recycle Bin
+- SYSTEM, SOFTWARE, NTUSER, and UsrClass registry hives
+- Jump Lists, shellbags, browser and PowerShell history, Recent Files, MRUs, RDP cache, thumbnails, UserAssist, and Windows Timeline
+
+It integrates utilities such as `PECmd`, `MFTECmd`, `EvtxECmd`, `Hayabusa`, `Chainsaw`, `APT-Hunter`, `AppCompatCacheParser`, `AmcacheParser`, `SrumECmd`, `JLECmd`, and others distributed under `cli/tools/`.
+
+### Investigation workspace
+
+Triager Web Console builds on the same parsing engine and adds:
+
+- Multiple cases and machines, with one evidence archive per host
+- Role-based access and per-case membership
+- Search, filtering, CSV export, and cross-machine correlation
+- Unified chronological timeline across artifacts and hosts
+- IOC list scanning
+- Investigator findings linked to artifact snapshots
+- OpenAI and Claude-compatible AI assistance
+- Word report generation
+- Partial artifact access while processing is still running
+- Downloadable processed evidence packages
+
+## Quick start
+
+### TL;DR
+
+- Download the project and double-click `build_all.bat`
+- It installs Python automatically if needed; if that fails, install
+  Python 3.10+ yourself from [python.org](https://www.python.org/downloads/) and re-run it
+
+### Triager CLI
+
+Requirements:
+
+- Python 3.10+
+- Dependencies from `cli/requirements.txt`
+- External forensic tools under `cli/tools/`
+
+```bash
+pip install -r cli/requirements.txt
+
+# Process a triage directory
+python3 triager.py --root triage_collection -o output_directory
+
+# Process a ZIP using the Aralez profile and compress the result
+python3 triager.py --zip triage_collection.zip \
+  --profile aralez -o output_directory --compress
+
+# Search previously processed output
+python3 triager.py -d output_directory --search "PsExec"
+
+# Scan processed output for indicators
+python3 triager.py -d output_directory --find-iocs cli/iocs.txt
+```
+
+Velociraptor is the default collection profile. Aralez is also built in:
+
+```bash
+--profile velociraptor
+--profile aralez
+```
+
+For another collection layout, provide a YAML configuration file. A custom configuration takes precedence over the selected profile:
+
+```bash
+python3 triager.py --zip collection.zip \
+  -c config.yml -o output_directory
+```
+
+A configuration maps artifact names to paths relative to the collection root, for example:
+
+```yaml
 System32: "uploads\\auto\\C%3A\\Windows\\System32"
 EventLogs: "uploads\\auto\\C%3A\\Windows\\System32\\winevt\\Logs"
-ScheduledTasks: "uploads\\auto\\C%3A\\Windows\\System32\\Tasks"
 Prefetch: "uploads\\auto\\C%3A\\Windows\\Prefetch"
 AmCache: "uploads\\auto\\C%3A\\Windows\\AppCompat\\Programs\\Amcache.hve"
-PCA: "uploads\\auto\\C%3A\\Windows\\AppCompat\\pca"
-WER: "uploads\\auto\\C%3A\\ProgramData\\Microsoft\\Windows\\WER"
-WindowsDefenderLogs: "uploads\\auto\\C%3A\\ProgramData\\Microsoft\\Windows Defender\\Support"
-SRUM: "uploads\\auto\\C%3A\\Windows\\System32\\sru\\SRUDB.dat"
-WMI: "uploads\\auto\\C%3A\\Windows\\System32\\wbem\\Repository\\OBJECTS.DATA"
-
-# If present in the triage (depends on how it was collected)
-RecycleBin: "uploads\\auto\\C%3A\\$Recycle.Bin"
-USNJournal: "uploads\\ntfs\\%5C%5C.%5CC%3A\\$Extend\\$UsnJrnl%3A$J"
 MFT: "uploads\\ntfs\\%5C%5C.%5CC%3A\\$MFT"
-LogFile: "uploads\\ntfs\\%5C%5C.%5CC%3A\\$LogFile"
-
-# Users root in triage
 Users: "uploads\\auto\\C%3A\\Users"
-
-# Registry hives
 RegistryHives:
   SYSTEM: "uploads\\auto\\C%3A\\Windows\\System32\\config\\SYSTEM"
   SOFTWARE: "uploads\\auto\\C%3A\\Windows\\System32\\config\\SOFTWARE"
-  SAM: "uploads\\auto\\C%3A\\Windows\\System32\\config\\SAM"
-  SECURITY: "uploads\\auto\\C%3A\\Windows\\System32\\config\\SECURITY"
-  DEFAULT: "uploads\\auto\\C%3A\\Windows\\System32\\config\\DEFAULT"
-
-# Per-user hives patterns
 UserHives:
   NTUSERGlob: "Users\\*\\NTUSER.DAT"
   USRCLASSGlob: "Users\\*\\AppData\\Local\\Microsoft\\Windows\\UsrClass.dat"
 ```
 
-# Usage
+### Triager Web Console
 
-Basic processing:
-
-```bash
-python3 triager.py --root triage_collection --output output_directory
-```
-
-Using a ZIP triage archive and custom config file:
+From the repository root:
 
 ```bash
-python3 triager.py \
-  --zip triage_collection.zip \
-  -c config.yml \
-  -o output_directory
+cd web
+pip install -r backend/requirements.txt
+python3 desktop/launcher.py
 ```
 
-Search across parsed output:
+The launcher starts the server and opens:
+
+```text
+http://127.0.0.1:8000
+```
+
+The launcher can run from source on Linux or Windows and can be packaged as a desktop distribution. Raw evidence ingestion requires the Windows `Triager.exe`; already processed `Triager` output can be imported without rerunning the parser.
+
+For direct server execution:
 
 ```bash
-python3 triager.py -d output_directory --search "PsExec"
-python3 triager.py -d output_directory --search "Invoke-WebRequest" --search-case-sensitive
-python3 triager.py -d output_directory --search "Mimikatz" --search-max-hits 50
+cd web/backend
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+export TRIAGER_WEB_ADMIN_USER=admin
+export TRIAGER_WEB_ADMIN_PASSWORD=change-me
+
+uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-IOC scan, basically searches common IOC names in a file (`iocs.txt` is included in this repository):
+## How the web pipeline works
 
-```bash
-python3 triager.py -d output_directory --find-iocs iocs.txt
-python3 triager.py -d output_directory --find-iocs iocs.txt --save-iocs iocs_dir
+Each case may contain multiple machines. Each machine represents one host and supports two ingestion paths:
+
+1. **Raw evidence** — extracts a `KAPE`, `Velociraptor`, or `Aralez` archive, runs `Triager`, and imports the resulting CSV files.
+2. **Processed output** — imports an archive containing an existing `Triager` output directory and skips parsing.
+
+```text
+Evidence ZIP
+    │
+    ▼
+Extraction
+    │
+    ▼
+Triager CLI execution ── skipped for processed output
+    │
+    ▼
+Normalized CSV files
+    │
+    ▼
+Per-case SQLite database + FTS5 indexes
+    │
+    ▼
+Browser investigation workspace
 ```
 
-## Typical workflow example
+Every CSV becomes a machine-namespaced table in a shared per-case SQLite database. FTS5 companion tables support fast correlation across large datasets, while timestamp columns are normalized during import to build the unified timeline efficiently.
 
-```bash
-python3 triager.py --config config.yml --root /mnt/triage_dir --output out_dir --zip-output
+Host information such as hostname, operating system, IP addresses, timezone, and installation date is read from `Meta/host_profile.json` after ingestion.
 
-python3 triager.py -d out_dir --search "schtasks" --search-max-hits 50
-python3 triager.py -d out_dir --find-iocs iocs.txt
+## Output structure
+
+```text
+Event logs/             APT-Hunter, Chainsaw, EvtxECmd, Hayabusa
+Evidence of execution/  Amcache, Prefetch, SRUM, WER, Defender detections
+File system artifacts/  $LogFile, MFT, Recycle Bin, USN Journal
+Meta/                   Host profile, software, autoruns, effective config
+Persistence/            Scheduled Tasks, WMI
+Registry/               BAM/DAM, Shimcache, USB
+User artifacts/         Browser history, Jump Lists, shellbags, UserAssist,
+                        PSReadLine, RDP cache, thumbnails, timelines, and more
 ```
 
-Results of searching for PsExec in the processed output:
+## Security notes
 
-<p align="center">
-    <img src="images/screenshot_search.png"/>
-</p>
+- Treat `storage/` as sensitive forensic evidence and restrict filesystem access.
+- AI analysis sends selected evidence to the endpoint configured by the investigator. Use a trusted local endpoint or obtain authorization before sending case data to a hosted provider.
 
-## Current output structure:
+## Standalone builds
 
-<p align="center">
-    <img src="images/output_structure.png"/>
-</p>
+Run `build_all.bat` from the repository root to build both in one go,
+it installs Python automatically if it is not already on `PATH` (by
+downloading the official installer from python.org), builds the CLI and
+the web desktop app, copies both into `compiled_binaries/` at the
+repository root, and starts Triager Web Console from there.
 
-```
-+---Event logs
-|   +---APT-Hunter
-|   +---Chainsaw
-|   +---EvtxECmd
-|   \---Hayabusa
-+---Evidence of execution
-|   +---AmCache
-|   |   +---AmCache-EvilHunter
-|   |   \---AmcacheParser
-|   +---Prefetch
-|   +---SRUM
-|   |   \---SrumECmd
-|   +---WER
-|   \---WindowsDefenderDetection
-+---File system artifacts
-|   +---LogFile
-|   +---MFT
-|   +---RecycleBin
-|   \---USNJournal
-+---Meta
-+---Persistence
-|   +---ScheduledTasks
-|   \---WMI
-+---Registry
-|   +---BamDam
-|   +---Shimcache
-|   \---USB
-\---User artifacts
-    +---BrowserHistory
-    +---Certutil
-    +---JumpLists
-    +---MUICache
-    +---NotepadFiles
-    +---NTUSER_Artifacts
-    +---PSReadLine
-    +---RDPCache
-    +---RecentLnk
-    +---Shellbags
-    +---Thumbnails
-    +---UserAssist
-    \---Win10Timelines
+```text
+compiled_binaries/
+  cli/Triager.exe
+  web/TriagerWeb.exe
 ```
 
-# Building executables
+- `cli/build.bat` creates a single-file Windows CLI executable, bundles
+  `cli/tools/` when available, and copies the result into
+  `web/backend/tools/`.
+- `web/desktop/build_web.bat` packages the web launcher into a standalone
+  distributable and includes `Triager.exe` from `web/backend/tools/` if
+  present. Both scripts set up their own virtual environment and install
+  their own dependencies, so they also work standalone.
 
-A `build.bat` script is provided to generate a standalone binary for Windows.
+## License
 
-# License
-
-This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
+Triager is released under the MIT License. See [LICENSE](LICENSE).

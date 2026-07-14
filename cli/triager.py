@@ -391,10 +391,7 @@ def load_yaml_config_from_text(text: str) -> JSONDict:
 
 def _set_nested(cfg: JSONDict, dotted_key: str, value: str) -> None:
     """
-    Backward compatible: supports:
-      - a=b
-      - a.b=c
-      - a.b.c=d
+    Backward compatible: supports: a=b a.b=c a.b.c=d
     """
     parts = [p.strip() for p in dotted_key.split(".") if p.strip()]
     if not parts:

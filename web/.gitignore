@@ -1,0 +1,11 @@
+storage/
+backend/triager_app.db
+backend/.venv/
+__pycache__/
+*.pyc
+.env
+backend/tools/*.exe
+desktop/build/
+desktop/dist/
+desktop/venv/
+desktop/*.spec.bak
