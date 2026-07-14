@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 
 from ..config import settings
 from ..database import get_db
-from ..models import User, Machine
+from ..models import User, Machine, CustomTriageConfig
 from ..schemas import IngestRequest
 from ..security import get_current_user, require_case_access
 from ..services import ingest_pipeline
@@ -78,8 +78,17 @@ def ingest(
 
     if payload.source_kind not in ("evidence", "processed"):
         raise HTTPException(400, "source_kind must be 'evidence' or 'processed'")
-    if payload.source_kind == "evidence" and payload.triage_profile not in ("velociraptor", "aralez"):
-        raise HTTPException(400, "triage_profile must be 'velociraptor' or 'aralez' for raw evidence")
+
+    custom_config = None
+    if payload.source_kind == "evidence":
+        if payload.custom_config_id:
+            custom_config = db.query(CustomTriageConfig).filter(
+                CustomTriageConfig.id == payload.custom_config_id
+            ).first()
+            if not custom_config:
+                raise HTTPException(404, "Selected custom config not found")
+        elif payload.triage_profile not in ("velociraptor", "aralez"):
+            raise HTTPException(400, "triage_profile must be 'velociraptor' or 'aralez', or pass custom_config_id")
 
     upload_zip_path = settings.storage_root / "uploads" / payload.upload_id / "archive.zip"
     if not upload_zip_path.exists():
@@ -88,7 +97,11 @@ def ingest(
     log_event(
         db, user, "machine.ingest_start", case_id=case_id, target_type="machine", target_id=machine_id,
         target_label=machine.label,
-        details={"source_kind": payload.source_kind, "triage_profile": payload.triage_profile},
+        details={
+            "source_kind": payload.source_kind,
+            "triage_profile": payload.triage_profile,
+            "custom_config": custom_config.name if custom_config else None,
+        },
         request=request,
     )
     db.commit()
@@ -100,5 +113,7 @@ def ingest(
         source_kind=payload.source_kind,
         triage_profile=payload.triage_profile,
         workers=payload.workers,
+        custom_config_content=custom_config.content if custom_config else None,
+        custom_config_name=custom_config.name if custom_config else None,
     )
     return job_ids

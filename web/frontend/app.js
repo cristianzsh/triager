@@ -145,7 +145,9 @@ function goToAiSettings() {
 // API
 async function api(path, { method = "GET", body, headers = {}, raw = false } = {}) {
   const opts = { method, headers: { ...headers } };
-  if (body !== undefined) {
+  if (body instanceof FormData) {
+    opts.body = body;
+  } else if (body !== undefined) {
     opts.headers["Content-Type"] = "application/json";
     opts.body = JSON.stringify(body);
   }
@@ -1564,7 +1566,7 @@ async function renderAiSettingsView() {
 }
 
 // Ingest wizard (per machine)
-function renderIngestWizard() {
+async function renderIngestWizard() {
   const main = document.getElementById("main");
   if (isReadOnly()) {
     main.innerHTML = `
@@ -1575,6 +1577,7 @@ function renderIngestWizard() {
     document.getElementById("bc-machines").addEventListener("click", (e) => { e.preventDefault(); state.currentMachine = null; renderCaseSidebar(); renderMachinesView(); });
     return;
   }
+  const customConfigs = await api("/configs");
   main.innerHTML = `
     <div class="breadcrumb"><a href="#" id="bc-machines">Machines</a> / ${state.currentMachine.label}</div>
     <h2>Ingest evidence -- ${state.currentMachine.label}</h2>
@@ -1593,7 +1596,16 @@ function renderIngestWizard() {
         <select id="ing-profile">
           <option value="velociraptor">Velociraptor</option>
           <option value="aralez">Aralez</option>
+          ${customConfigs.map((c) => `<option value="custom:${c.id}">Custom: ${escapeHtml(c.name)}</option>`).join("")}
+          <option value="__custom_new__">Custom config -- upload a new .yml file</option>
         </select>
+      </div>
+      <div class="form-row" id="custom-config-row" style="display:none">
+        <label>Config name</label>
+        <input id="ing-custom-name" type="text" placeholder="e.g. Aralez v2 layout" />
+        <label style="margin-top:8px">Config .yml file</label>
+        <input id="ing-custom-file" type="file" accept=".yml,.yaml" />
+        <div class="hint">Saved after this upload -- reusable for future ingests without uploading it again. Every path in it must stay relative to the triage root (no ".." or absolute paths).</div>
       </div>
       <div class="form-row">
         <label>ZIP file</label>
@@ -1607,12 +1619,19 @@ function renderIngestWizard() {
 
   document.getElementById("ing-kind").addEventListener("change", (e) => {
     document.getElementById("profile-row").style.display = e.target.value === "evidence" ? "block" : "none";
+    if (e.target.value !== "evidence") document.getElementById("custom-config-row").style.display = "none";
+    else updateCustomConfigRow();
   });
+  document.getElementById("ing-profile").addEventListener("change", updateCustomConfigRow);
+  function updateCustomConfigRow() {
+    document.getElementById("custom-config-row").style.display =
+      document.getElementById("ing-profile").value === "__custom_new__" ? "block" : "none";
+  }
 
   document.getElementById("ing-start").addEventListener("click", startIngest);
 }
 
-function startIngest() {
+async function startIngest() {
   const fileInput = document.getElementById("ing-file");
   const file = fileInput.files[0];
   if (!file) { alert("Choose a .zip file first"); return; }
@@ -1620,6 +1639,33 @@ function startIngest() {
   const profile = document.getElementById("ing-profile").value;
   const progressEl = document.getElementById("upload-progress");
   const machineId = state.currentMachine.id;
+
+  let triageProfile = null;
+  let customConfigId = null;
+
+  if (kind === "evidence") {
+    if (profile === "__custom_new__") {
+      const configFile = document.getElementById("ing-custom-file").files[0];
+      const configName = document.getElementById("ing-custom-name").value.trim();
+      if (!configFile) { alert("Choose a .yml config file first"); return; }
+      if (!configName) { alert("Give the config a name so you can find it again next time"); return; }
+      progressEl.textContent = "Uploading config...";
+      const cfgForm = new FormData();
+      cfgForm.append("name", configName);
+      cfgForm.append("file", configFile);
+      try {
+        const saved = await api("/configs", { method: "POST", body: cfgForm });
+        customConfigId = saved.id;
+      } catch (ex) {
+        progressEl.textContent = `Config upload failed: ${ex.message}`;
+        return;
+      }
+    } else if (profile.startsWith("custom:")) {
+      customConfigId = profile.slice("custom:".length);
+    } else {
+      triageProfile = profile;
+    }
+  }
 
   const form = new FormData();
   form.append("file", file);
@@ -1646,7 +1692,8 @@ function startIngest() {
         body: {
           upload_id: uploadResp.upload_id,
           source_kind: kind,
-          triage_profile: kind === "evidence" ? profile : null,
+          triage_profile: triageProfile,
+          custom_config_id: customConfigId,
           workers: 0,
         },
       });

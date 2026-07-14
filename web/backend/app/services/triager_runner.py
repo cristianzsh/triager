@@ -68,9 +68,13 @@ def run_triager(
     evidence_root: Path,
     output_dir: Path,
     log_path: Path,
-    triage_profile: str,
+    triage_profile: str | None,
     workers: int,
+    config_path: Path | None = None,
 ) -> None:
+    """Either triage_profile (a built-in "velociraptor"/"aralez" name,
+    passed as --profile) or config_path (a specific .yml on disk, passed
+    as -c) should be given; config_path takes precedence if both are."""
     db = SessionLocal()
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -78,13 +82,12 @@ def run_triager(
         _set_job(db, job_id, status=JobStatus.running, started_at=dt.datetime.utcnow(),
                   log_path=str(log_path), message="Launching Triager")
 
-        cmd = [
-            settings.triager_exe_path,
-            "--root", str(evidence_root),
-            "--profile", triage_profile,
-            "-o", str(output_dir),
-            "--workers", str(workers or 0),
-        ]
+        cmd = [settings.triager_exe_path, "--root", str(evidence_root), "-o", str(output_dir),
+               "--workers", str(workers or 0)]
+        if config_path:
+            cmd += ["-c", str(config_path)]
+        else:
+            cmd += ["--profile", triage_profile or "velociraptor"]
 
         parsed_count = 0
         with log_path.open("w", encoding="utf-8", errors="replace") as logf:

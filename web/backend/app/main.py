@@ -9,14 +9,14 @@ from .database import Base, engine, SessionLocal
 from .models import User, Role
 from .security import hash_password
 from .runtime_paths import bundle_dir
-from .routers import auth, users, cases, machines, upload, jobs, artifacts, correlation, ai, audit, timeline, ioc_scan, report, findings
+from .routers import auth, users, cases, machines, upload, jobs, artifacts, correlation, ai, audit, timeline, ioc_scan, report, findings, configs
 
 app = FastAPI(title="Triager Web", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # tighten in production (reverse proxy / same-origin deployment recommended)
-    allow_credentials=True,
+    allow_credentials=False,  # auth is a Bearer token, never a cookie, so this isn't needed
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -26,6 +26,15 @@ app.add_middleware(
 def on_startup():
     Base.metadata.create_all(bind=engine)
     _bootstrap_admin()
+    _warn_if_default_jwt_secret()
+
+
+def _warn_if_default_jwt_secret():
+    from .config import settings
+    if settings.jwt_secret == "CHANGE_ME_IN_PRODUCTION":
+        print("[!] WARNING: TRIAGER_WEB_JWT_SECRET is still the default placeholder.")
+        print("[!] Every login token can be forged by anyone who reads the source.")
+        print("[!] Set a real secret before exposing this beyond your own machine.")
 
 
 def _bootstrap_admin():
@@ -84,6 +93,7 @@ app.include_router(timeline.router)
 app.include_router(ioc_scan.router)
 app.include_router(report.router)
 app.include_router(findings.router)
+app.include_router(configs.router)
 
 
 @app.get("/api/health")

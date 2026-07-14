@@ -111,8 +111,19 @@ class IngestRequest(BaseModel):
     upload_id: str
     # What kind of archive was just uploaded.
     source_kind: str          # "evidence" (raw, needs Triager run) | "processed" (already Triager CSV output)
-    triage_profile: Optional[str] = None   # "velociraptor" | "aralez", required when source_kind == "evidence"
+    triage_profile: Optional[str] = None   # "velociraptor" | "aralez", required when source_kind == "evidence" and no custom_config_id
+    custom_config_id: Optional[str] = None  # use an uploaded custom config instead of a built-in profile
     workers: int = 0
+
+
+class CustomConfigOut(BaseModel):
+    id: str
+    name: str
+    uploaded_by_username: Optional[str]
+    created_at: dt.datetime
+
+    class Config:
+        from_attributes = True
 
 
 class JobOut(BaseModel):

@@ -27,12 +27,16 @@ Triager processes and organizes evidence from:
 
 It integrates utilities such as `PECmd`, `MFTECmd`, `EvtxECmd`, `Hayabusa`, `Chainsaw`, `APT-Hunter`, `AppCompatCacheParser`, `AmcacheParser`, `SrumECmd`, `JLECmd`, and others distributed under `cli/tools/`.
 
+<img src="images/cli_execution.png"/>
+<img src="images/cli_output_structure.png"/>
+
 ### Investigation workspace
 
 Triager Web Console builds on the same parsing engine and adds:
 
 - Multiple cases and machines, with one evidence archive per host
 - Role-based access and per-case membership
+- Velociraptor and Aralez profiles built in, plus reusable custom triage configs uploaded through the UI
 - Search, filtering, CSV export, and cross-machine correlation
 - Unified chronological timeline across artifacts and hosts
 - IOC list scanning
@@ -41,6 +45,11 @@ Triager Web Console builds on the same parsing engine and adds:
 - Word report generation
 - Partial artifact access while processing is still running
 - Downloadable processed evidence packages
+
+<img src="images/web_machine.png"/>
+<img src="images/web_ai_summary.png"/>
+<img src="images/web_filter.png"/>
+<img src="images/web_ai_report.png"/>
 
 ## Quick start
 

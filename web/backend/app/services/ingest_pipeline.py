@@ -70,6 +70,8 @@ def start_ingest(
     source_kind: str,
     triage_profile: str | None,
     workers: int,
+    custom_config_content: str | None = None,
+    custom_config_name: str | None = None,
 ) -> list[str]:
     """Creates the job rows synchronously (so the API response can return
     their ids right away) and launches the pipeline thread."""
@@ -79,7 +81,7 @@ def start_ingest(
         if machine:
             machine.status = MachineStatus.ingesting
             machine.source_kind = source_kind
-            machine.triage_profile = triage_profile
+            machine.triage_profile = f"custom: {custom_config_name}" if custom_config_content else triage_profile
             machine.error_message = None
             db.commit()
 
@@ -103,7 +105,7 @@ def start_ingest(
         target=_run_pipeline,
         args=(
             case_id, machine_id, upload_zip_path, source_kind, triage_profile, workers,
-            extract_job_id, triager_job_id, import_job_id,
+            extract_job_id, triager_job_id, import_job_id, custom_config_content,
         ),
         daemon=True,
     )
@@ -131,6 +133,7 @@ def _run_pipeline(
     extract_job_id: str,
     triager_job_id: str | None,
     import_job_id: str,
+    custom_config_content: str | None = None,
 ) -> None:
     db = SessionLocal()
     mdir = machine_dir(case_id, machine_id)
@@ -190,6 +193,11 @@ def _run_pipeline(
             incremental_thread.start()
 
             try:
+                config_path = None
+                if custom_config_content:
+                    config_path = mdir / "custom_config.yml"
+                    config_path.write_text(custom_config_content, encoding="utf-8")
+
                 run_triager(
                     job_id=triager_job_id,
                     evidence_root=effective_root,
@@ -197,6 +205,7 @@ def _run_pipeline(
                     log_path=triager_log,
                     triage_profile=triage_profile or "velociraptor",
                     workers=workers,
+                    config_path=config_path,
                 )
             finally:
                 stop_incremental.set()

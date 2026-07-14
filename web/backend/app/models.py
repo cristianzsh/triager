@@ -239,3 +239,18 @@ class Finding(Base):
     created_by_username = Column(String, nullable=True)
     created_at = Column(DateTime, default=dt.datetime.utcnow)
     updated_at = Column(DateTime, default=dt.datetime.utcnow, onupdate=dt.datetime.utcnow)
+
+
+class CustomTriageConfig(Base):
+    """A reusable triage config .yml uploaded through the web UI, alongside
+    the built-in velociraptor/aralez profiles. Content is validated and
+    stored as text (not a path) so ingest never touches a file a user
+    could later move/replace out from under a running job."""
+    __tablename__ = "custom_triage_configs"
+
+    id = Column(String, primary_key=True, default=uid)
+    name = Column(String, nullable=False)
+    content = Column(Text, nullable=False)
+    uploaded_by = Column(String, ForeignKey("users.id"), nullable=True)
+    uploaded_by_username = Column(String, nullable=True)
+    created_at = Column(DateTime, default=dt.datetime.utcnow)
