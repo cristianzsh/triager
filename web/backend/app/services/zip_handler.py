@@ -43,6 +43,9 @@ def extract_zip(
     zip_path: Path,
     dest_root: Path,
     progress_cb: Optional[Callable[[int, int], None]] = None,
+    skip_large_files: bool = False,
+    max_file_size_bytes: int = 0,
+    log_cb: Optional[Callable[[str], None]] = None,
 ) -> Path:
     """
     Extracts zip_path under dest_root. Returns the effective root
@@ -55,12 +58,27 @@ def extract_zip(
 
     dest_root.mkdir(parents=True, exist_ok=True)
     warned = 0
+    skipped_large = 0
+    skipped_large_bytes = 0
 
     with zipfile.ZipFile(zip_path, "r") as zf:
         members = [zi for zi in zf.infolist() if not zi.filename.endswith("/")]
         total = len(members)
         for i, zi in enumerate(members, 1):
             raw_name = zi.filename.replace("\\", "/")
+
+            if skip_large_files and max_file_size_bytes and zi.file_size > max_file_size_bytes:
+                skipped_large += 1
+                skipped_large_bytes += zi.file_size
+                if log_cb:
+                    log_cb(
+                        f"Skipping large file ({zi.file_size / (1024 * 1024):.1f} MB, "
+                        f"over {max_file_size_bytes / (1024 * 1024):.0f} MB limit): {zi.filename}"
+                    )
+                if progress_cb:
+                    progress_cb(i, total)
+                continue
+
             try:
                 out_path = _safe_join(dest_root, raw_name)
                 out_path = _truncate_path(out_path)
@@ -72,6 +90,12 @@ def extract_zip(
                 continue
             if progress_cb:
                 progress_cb(i, total)
+
+    if skipped_large and log_cb:
+        log_cb(
+            f"Skipped {skipped_large} large file(s) ({skipped_large_bytes / (1024 * 1024):.1f} MB total) "
+            f"not extracted (skip-large-files enabled)."
+        )
 
     try:
         children = [p for p in dest_root.iterdir() if p.name not in (".DS_Store", "__MACOSX")]

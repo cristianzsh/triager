@@ -94,6 +94,9 @@ def ingest(
     if not upload_zip_path.exists():
         raise HTTPException(404, "Unknown upload_id (upload may have expired or failed)")
 
+    if payload.max_file_size_mb <= 0:
+        raise HTTPException(400, "max_file_size_mb must be positive")
+
     log_event(
         db, user, "machine.ingest_start", case_id=case_id, target_type="machine", target_id=machine_id,
         target_label=machine.label,
@@ -101,6 +104,9 @@ def ingest(
             "source_kind": payload.source_kind,
             "triage_profile": payload.triage_profile,
             "custom_config": custom_config.name if custom_config else None,
+            "skip_large_files": payload.skip_large_files,
+            "max_file_size_mb": payload.max_file_size_mb if payload.skip_large_files else None,
+            "exclude_parsers": payload.exclude_parsers,
         },
         request=request,
     )
@@ -115,5 +121,8 @@ def ingest(
         workers=payload.workers,
         custom_config_content=custom_config.content if custom_config else None,
         custom_config_name=custom_config.name if custom_config else None,
+        skip_large_files=payload.skip_large_files,
+        max_file_size_mb=payload.max_file_size_mb,
+        exclude_parsers=payload.exclude_parsers,
     )
     return job_ids

@@ -114,6 +114,9 @@ class IngestRequest(BaseModel):
     triage_profile: Optional[str] = None   # "velociraptor" | "aralez", required when source_kind == "evidence" and no custom_config_id
     custom_config_id: Optional[str] = None  # use an uploaded custom config instead of a built-in profile
     workers: int = 0
+    skip_large_files: bool = False
+    max_file_size_mb: int = 1024
+    exclude_parsers: Optional[list[str]] = None
 
 
 class CustomConfigOut(BaseModel):

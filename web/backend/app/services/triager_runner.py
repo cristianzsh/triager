@@ -9,14 +9,11 @@ queueing, running as a background job, tailing output, and updating the
 Job row so the UI can show progress.
 
 Windows-only: Triager is currently only built for Windows (Triager.exe).
-Always uses settings.triager_exe_path.
-
-NOTE: Triager itself doesn't emit a numeric percentage, so progress here is
-coarse (based on which of its ~30 parsers has started, parsed from stdout
-"[INFO] Running: <name>" lines) rather than exact, good enough for a
-progress bar, not for ETA math.
+Resolved via resolve_triager_exe(): the configured settings.triager_exe_path
+if that exact file exists, otherwise falls back to the system PATH.
 """
 import re
+import shutil
 import subprocess
 import threading
 import datetime as dt
@@ -32,6 +29,64 @@ from ..models import Job, JobStatus
 # Used only to estimate progress_pct; see run_selected_parsers() in triager.py.
 EXPECTED_PARSER_COUNT = 30
 RUNNING_RE = re.compile(r"\[INFO\]\s+Running:\s+(.+)")
+
+
+def resolve_triager_exe() -> str:
+    """settings.triager_exe_path defaults to a specific file
+    (backend/tools/Triager.exe or the packaged app's equivalent).
+    """
+    configured = settings.triager_exe_path
+    if Path(configured).is_file():
+        return configured
+
+    found = shutil.which(configured) or shutil.which("Triager.exe") or shutil.which("Triager")
+    if found:
+        return found
+
+    return configured  # let the caller's own error handling report the failure
+
+
+PARSER_NAMES = [
+    "AmCache",
+    "Defender",
+    "PCA",
+    "Prefetch",
+    "SRUM",
+    "WER",
+    "ScheduledTasks",
+    "WMI",
+    "BamDam",
+    "LastVisitedMRU",
+    "MUICache",
+    "OfficeMRU",
+    "OpenSaveMRU",
+    "RunMRU",
+    "Shellbags",
+    "Shimcache",
+    "TypedPaths",
+    "USB",
+    "UserAssist",
+    "WordWheelQuery",
+    "BrowserHistory",
+    "Certutil",
+    "JumpLists",
+    "Notepad",
+    "PSReadLine",
+    "RDPCache",
+    "RecentDocs",
+    "RecentLnk",
+    "Thumbcache",
+    "Win10Timelines",
+    "MFT",
+    "RecycleBin",
+    "USNJournal",
+    "EventLog",
+    "LogFile",
+]
+
+
+def list_parser_names() -> list[str]:
+    return PARSER_NAMES
 
 
 def start_triager_job(
@@ -71,6 +126,7 @@ def run_triager(
     triage_profile: str | None,
     workers: int,
     config_path: Path | None = None,
+    exclude_parsers: list[str] | None = None,
 ) -> None:
     """Either triage_profile (a built-in "velociraptor"/"aralez" name,
     passed as --profile) or config_path (a specific .yml on disk, passed
@@ -82,12 +138,14 @@ def run_triager(
         _set_job(db, job_id, status=JobStatus.running, started_at=dt.datetime.utcnow(),
                   log_path=str(log_path), message="Launching Triager")
 
-        cmd = [settings.triager_exe_path, "--root", str(evidence_root), "-o", str(output_dir),
+        cmd = [resolve_triager_exe(), "--root", str(evidence_root), "-o", str(output_dir),
                "--workers", str(workers or 0)]
         if config_path:
             cmd += ["-c", str(config_path)]
         else:
             cmd += ["--profile", triage_profile or "velociraptor"]
+        if exclude_parsers:
+            cmd += ["--exclude-parser", ",".join(exclude_parsers)]
 
         parsed_count = 0
         with log_path.open("w", encoding="utf-8", errors="replace") as logf:

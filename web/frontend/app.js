@@ -1578,6 +1578,7 @@ async function renderIngestWizard() {
     return;
   }
   const customConfigs = await api("/configs");
+  const availableParsers = await api("/triager/parsers");
   main.innerHTML = `
     <div class="breadcrumb"><a href="#" id="bc-machines">Machines</a> / ${state.currentMachine.label}</div>
     <h2>Ingest evidence -- ${state.currentMachine.label}</h2>
@@ -1607,6 +1608,19 @@ async function renderIngestWizard() {
         <input id="ing-custom-file" type="file" accept=".yml,.yaml" />
         <div class="hint">Saved after this upload -- reusable for future ingests without uploading it again. Every path in it must stay relative to the triage root (no ".." or absolute paths).</div>
       </div>
+      <div class="form-row" id="exclude-parsers-row">
+        <label>Skip specific parsers (optional)</label>
+        <div class="chip-box">
+          ${availableParsers.length ? availableParsers.map((p) => `<label class="chip"><input type="checkbox" class="exclude-parser-chk" value="${escapeAttr(p)}" style="width:auto"/> ${escapeHtml(p)}</label>`).join("") : `<span class="hint">Parser list unavailable (Triager.exe not found on the server).</span>`}
+        </div>
+      </div>
+      <div class="form-row">
+        <label><input type="checkbox" id="ing-skip-large" style="width:auto"/> Skip large files</label>
+        <div id="ing-max-size-row" style="display:none; margin-top:6px">
+          <label>Max file size (MB)</label>
+          <input id="ing-max-size" type="number" min="1" value="1024" style="width:120px" />
+        </div>
+      </div>
       <div class="form-row">
         <label>ZIP file</label>
         <input id="ing-file" type="file" accept=".zip" />
@@ -1617,9 +1631,15 @@ async function renderIngestWizard() {
   `;
   document.getElementById("bc-machines").addEventListener("click", (e) => { e.preventDefault(); state.currentMachine = null; renderCaseSidebar(); renderMachinesView(); });
 
+  document.getElementById("ing-skip-large").addEventListener("change", (e) => {
+    document.getElementById("ing-max-size-row").style.display = e.target.checked ? "block" : "none";
+  });
+
   document.getElementById("ing-kind").addEventListener("change", (e) => {
-    document.getElementById("profile-row").style.display = e.target.value === "evidence" ? "block" : "none";
-    if (e.target.value !== "evidence") document.getElementById("custom-config-row").style.display = "none";
+    const isEvidence = e.target.value === "evidence";
+    document.getElementById("profile-row").style.display = isEvidence ? "block" : "none";
+    document.getElementById("exclude-parsers-row").style.display = isEvidence ? "block" : "none";
+    if (!isEvidence) document.getElementById("custom-config-row").style.display = "none";
     else updateCustomConfigRow();
   });
   document.getElementById("ing-profile").addEventListener("change", updateCustomConfigRow);
@@ -1687,6 +1707,8 @@ async function startIngest() {
     const uploadResp = JSON.parse(xhr.responseText);
     progressEl.textContent = "Upload complete. Starting ingest pipeline...";
     try {
+      const skipLarge = document.getElementById("ing-skip-large").checked;
+      const excludeParsers = Array.from(document.querySelectorAll(".exclude-parser-chk:checked")).map((n) => n.value);
       await api(`/cases/${state.currentCase.id}/machines/${machineId}/ingest`, {
         method: "POST",
         body: {
@@ -1695,6 +1717,9 @@ async function startIngest() {
           triage_profile: triageProfile,
           custom_config_id: customConfigId,
           workers: 0,
+          skip_large_files: skipLarge,
+          max_file_size_mb: skipLarge ? Number(document.getElementById("ing-max-size").value || 1024) : 1024,
+          exclude_parsers: excludeParsers.length ? excludeParsers : null,
         },
       });
       await openMachine(machineId);

@@ -2613,62 +2613,97 @@ def parse_event_logs(artifact_paths: PathMap, outdirs: dict[str, Path]) -> None:
 
 
 # Orchestration
+PARSER_TOOLS: list[tuple[str, Callable[[PathMap, dict[str, Path]], None]]] = [
+    # Evidence of execution
+    ("AmCache", parse_amcache),
+    ("Defender", parse_defender_logs),
+    ("PCA", parse_pca),
+    ("Prefetch", parse_prefetch),
+    ("SRUM", parse_srum),
+    ("WER", parse_wer),
+
+    # Persistence
+    ("ScheduledTasks", parse_scheduled_tasks),
+    ("WMI", parse_wmi),
+
+    # Registry
+    ("BamDam", parse_bam_dam),
+    ("LastVisitedMRU", parse_lastvisitedmru),
+    ("MUICache", parse_muicache),
+    ("OfficeMRU", parse_officemru),
+    ("OpenSaveMRU", parse_opensavemru),
+    ("RunMRU", parse_runmru),
+    ("Shellbags", parse_shellbags),
+    ("Shimcache", parse_shimcache),
+    ("TypedPaths", parse_typedpaths),
+    ("USB", parse_usb),
+    ("UserAssist", parse_userassist),
+    ("WordWheelQuery", parse_wordwheelquery),
+
+    # User artifacts
+    ("BrowserHistory", parse_browser_history),
+    ("Certutil", parse_certutil_artifacts),
+    ("JumpLists", parse_jumplists),
+    ("Notepad", parse_notepad_files),
+    ("PSReadLine", parse_psreadline),
+    ("RDPCache", parse_rdp_cache),
+    ("RecentDocs", parse_recentdocs),
+    ("RecentLnk", parse_recent_lnk),
+    ("Thumbcache", parse_thumbnails),
+    ("Win10Timelines", parse_win10_timelines),
+
+    # File system artifacts
+    ("MFT", parse_mft),
+    ("RecycleBin", parse_recycle_bin),
+    ("USNJournal", parse_usnjournal),
+
+    # Event logs
+    ("EventLog", parse_event_logs),
+
+    # Slow parsers
+    ("LogFile", parse_logfile),
+]
+
+
+def _normalize_parser_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", name.lower())
+
+
+def _parser_token_matches(user_token: str, tool_name: str) -> bool:
+    user_norm = _normalize_parser_name(user_token)
+    if not user_norm:
+        return False
+    tool_norm = _normalize_parser_name(tool_name)
+    if user_norm == tool_norm:
+        return True
+
+    return len(user_norm) >= 3 and tool_norm.startswith(user_norm)
+
+
 def run_selected_parsers(
     artifact_paths: PathMap,
     outdirs: dict[str, Path],
     *,
     workers: int = 0,
+    exclude: set[str] | None = None,
 ) -> None:
-    TOOLS: list[tuple[str, Callable[[PathMap, dict[str, Path]], None]]] = [
-        # Evidence of execution
-        ("AmCache parsers", parse_amcache),
-        ("Windows Defender log analysis", parse_defender_logs),
-        ("PCA analysis", parse_pca),
-        ("Prefetch PECmd parser", parse_prefetch),
-        ("SRUM SrumECmd parser", parse_srum),
-        ("WER analysis", parse_wer),
-
-        # Persistence
-        ("Scheduled Tasks analysis", parse_scheduled_tasks),
-        ("WMI persistence analysis", parse_wmi),
-
-        # Registry
-        ("Bam/Dam extraction", parse_bam_dam),
-        ("LastVisitedMRU extraction", parse_lastvisitedmru),
-        ("MUICache extraction", parse_muicache),
-        ("OfficeMRU extraction", parse_officemru),
-        ("OpenSaveMRU extraction", parse_opensavemru),
-        ("RunMRU extraction", parse_runmru),
-        ("Shellbags extraction", parse_shellbags),
-        ("Shimcache extraction", parse_shimcache),
-        ("TypedPaths extraction", parse_typedpaths),
-        ("USB extraction", parse_usb),
-        ("UserAssist extraction", parse_userassist),
-        ("WordWheelQuery extraction", parse_wordwheelquery),
-
-        # User artifacts
-        ("BrowserHistory extraction", parse_browser_history),
-        ("Certutil analysis", parse_certutil_artifacts),
-        ("JumpLists parsing", parse_jumplists),
-        ("Notepad artifact extraction", parse_notepad_files),
-        ("PSReadLine artifact extraction", parse_psreadline),
-        ("RDP_Cache artifact extraction", parse_rdp_cache),
-        ("RecentDocs artifact parsing", parse_recentdocs),
-        ("RecentLnk artifact parsing", parse_recent_lnk),
-        ("Thumbcache artifact parsing", parse_thumbnails),
-        ("Win10Timelines parsing", parse_win10_timelines),
-
-        # File system artifacts
-        ("MFT parsing", parse_mft),
-        ("RecycleBin parsing", parse_recycle_bin),
-        ("USNJournal parsing", parse_usnjournal),
-
-        # Event logs
-        ("Event Log analysis", parse_event_logs),
-
-        # Slow parsers
-        ("LogFile parsing", parse_logfile)
-    ]
+    TOOLS = PARSER_TOOLS
+    if exclude:
+        excluded_names: list[str] = []
+        matched_tokens: set[str] = set()
+        for name, _ in TOOLS:
+            for token in exclude:
+                if _parser_token_matches(token, name):
+                    excluded_names.append(name)
+                    matched_tokens.add(token)
+                    break
+        unmatched = set(exclude) - matched_tokens
+        if unmatched:
+            log_warn(f"--exclude-parser: no parser matched: {', '.join(sorted(unmatched))} (see --list-parsers)")
+        if excluded_names:
+            log_info(f"Excluding parser(s): {', '.join(excluded_names)}")
+        excluded_set = set(excluded_names)
+        TOOLS = [(name, fn) for name, fn in TOOLS if name not in excluded_set]
 
     # Don't spawn too many heavy external tools at once
     if workers and workers > 0:
@@ -2846,7 +2881,11 @@ def find_iocs_in_output_dir(
 
 
 # Extract .ZIP compressed triage
-def _extract_zip_to_temp(zip_path: Path) -> Path:
+def _extract_zip_to_temp(
+    zip_path: Path,
+    skip_large_files: bool = False,
+    max_file_size_bytes: int = 0,
+) -> Path:
     """
     Extract ZIP to a unique temp directory and return the extracted root.
     """
@@ -2893,11 +2932,22 @@ def _extract_zip_to_temp(zip_path: Path) -> Path:
         return p.with_name(new_name)
 
     warned = 0
+    skipped_large = 0
+    skipped_large_bytes = 0
 
     with zipfile.ZipFile(zip_path, "r") as zf:
         for zi in zf.infolist():
             raw_name = zi.filename.replace("\\", "/")
             if raw_name.endswith("/"):
+                continue
+
+            if skip_large_files and max_file_size_bytes and zi.file_size > max_file_size_bytes:
+                skipped_large += 1
+                skipped_large_bytes += zi.file_size
+                log_warn(
+                    f"Skipping large file ({zi.file_size / (1024 * 1024):.1f} MB, "
+                    f"over {max_file_size_bytes / (1024 * 1024):.0f} MB limit): {zi.filename}"
+                )
                 continue
 
             try:
@@ -2918,6 +2968,11 @@ def _extract_zip_to_temp(zip_path: Path) -> Path:
 
     if warned:
         log_warn(f"ZIP extraction completed with {warned} skipped file(s) due to invalid paths/names.")
+    if skipped_large:
+        log_warn(
+            f"Skipped {skipped_large} large file(s) ({skipped_large_bytes / (1024 * 1024):.1f} MB total) "
+            f"not extracted due to --skip-large-files."
+        )
 
     # If the zip contains a single top-level directory, use it as triage root.
     try:
@@ -2928,6 +2983,16 @@ def _extract_zip_to_temp(zip_path: Path) -> Path:
         pass
 
     return tmp_root
+
+
+def _flatten_exclude_parser(raw: list[str]) -> set[str]:
+    names: set[str] = set()
+    for entry in raw or []:
+        for part in entry.split(","):
+            part = part.strip()
+            if part:
+                names.add(part)
+    return names
 
 
 def parse_args() -> argparse.Namespace:
@@ -2998,8 +3063,34 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="After processing, zip the whole output directory into <output_directory>.zip alongside it.",
     )
+    ap.add_argument(
+        "--skip-large-files",
+        action="store_true",
+        help="Don't extract files from --zip larger than --max-file-size-mb.",
+    )
+    ap.add_argument(
+        "--max-file-size-mb",
+        type=int,
+        default=1024,
+        help="Size threshold in MB used with --skip-large-files.",
+    )
+    ap.add_argument(
+        "--exclude-parser",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="Skip a parser (comma-separated).",
+    )
+    ap.add_argument(
+        "--list-parsers",
+        action="store_true",
+        help="Print every available parser name and exit.",
+    )
 
     args = ap.parse_args()
+
+    if args.list_parsers:
+        return args
 
     # Validate mode combinations
     if args.search or args.find_iocs:
@@ -3026,6 +3117,11 @@ def main() -> int:
         log_error(f"Tools directory not found: {TOOLS_DIR}")
 
     args = parse_args()
+
+    if args.list_parsers:
+        for name, _ in PARSER_TOOLS:
+            print(name)
+        return 0
 
     # Post-processing mode: SEARCH
     if args.search:
@@ -3077,7 +3173,11 @@ def main() -> int:
         if args.zip:
             log_info("Extracting ZIP file")
             zip_path = Path(args.zip).expanduser().resolve()
-            extracted_root = _extract_zip_to_temp(zip_path)
+            extracted_root = _extract_zip_to_temp(
+                zip_path,
+                skip_large_files=bool(args.skip_large_files),
+                max_file_size_bytes=int(args.max_file_size_mb or 0) * 1024 * 1024,
+            )
 
             # Override config root
             cfg["root"] = str(extracted_root)
@@ -3120,7 +3220,10 @@ def main() -> int:
         if hp.os_install_date:
             log_info(f"Install: {hp.os_install_date}")
 
-        run_selected_parsers(artifact_paths, outdirs, workers=int(args.workers or 0))
+        run_selected_parsers(
+            artifact_paths, outdirs, workers=int(args.workers or 0),
+            exclude=_flatten_exclude_parser(args.exclude_parser),
+        )
 
         if args.compress:
             log_step("Compressing output directory...")

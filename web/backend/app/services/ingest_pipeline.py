@@ -72,6 +72,9 @@ def start_ingest(
     workers: int,
     custom_config_content: str | None = None,
     custom_config_name: str | None = None,
+    skip_large_files: bool = False,
+    max_file_size_mb: int = 1024,
+    exclude_parsers: list[str] | None = None,
 ) -> list[str]:
     """Creates the job rows synchronously (so the API response can return
     their ids right away) and launches the pipeline thread."""
@@ -106,6 +109,7 @@ def start_ingest(
         args=(
             case_id, machine_id, upload_zip_path, source_kind, triage_profile, workers,
             extract_job_id, triager_job_id, import_job_id, custom_config_content,
+            skip_large_files, max_file_size_mb, exclude_parsers,
         ),
         daemon=True,
     )
@@ -134,6 +138,9 @@ def _run_pipeline(
     triager_job_id: str | None,
     import_job_id: str,
     custom_config_content: str | None = None,
+    skip_large_files: bool = False,
+    max_file_size_mb: int = 1024,
+    exclude_parsers: list[str] | None = None,
 ) -> None:
     db = SessionLocal()
     mdir = machine_dir(case_id, machine_id)
@@ -153,7 +160,12 @@ def _run_pipeline(
                 _write_log(extract_log, f"Extracted {done}/{total} files")
 
         try:
-            effective_root = zip_handler.extract_zip(upload_zip_path, dest_root, _extract_progress)
+            effective_root = zip_handler.extract_zip(
+                upload_zip_path, dest_root, _extract_progress,
+                skip_large_files=skip_large_files,
+                max_file_size_bytes=int(max_file_size_mb or 0) * 1024 * 1024,
+                log_cb=lambda msg: _write_log(extract_log, msg),
+            )
         except Exception as ex:  # noqa: BLE001
             _write_log(extract_log, f"ERROR: {ex}")
             _set_job(db, extract_job_id, status=JobStatus.failed, message=str(ex),
@@ -206,6 +218,7 @@ def _run_pipeline(
                     triage_profile=triage_profile or "velociraptor",
                     workers=workers,
                     config_path=config_path,
+                    exclude_parsers=exclude_parsers,
                 )
             finally:
                 stop_incremental.set()

@@ -9,7 +9,7 @@ from .database import Base, engine, SessionLocal
 from .models import User, Role
 from .security import hash_password
 from .runtime_paths import bundle_dir
-from .routers import auth, users, cases, machines, upload, jobs, artifacts, correlation, ai, audit, timeline, ioc_scan, report, findings, configs
+from .routers import auth, users, cases, machines, upload, jobs, artifacts, correlation, ai, audit, timeline, ioc_scan, report, findings, configs, triager_info
 
 app = FastAPI(title="Triager Web", version="0.1.0")
 
@@ -94,6 +94,7 @@ app.include_router(ioc_scan.router)
 app.include_router(report.router)
 app.include_router(findings.router)
 app.include_router(configs.router)
+app.include_router(triager_info.router)
 
 
 @app.get("/api/health")
