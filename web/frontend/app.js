@@ -17,6 +17,7 @@ const state = {
   sortDir: "asc",
   currentSearch: "",
   jobPollTimer: null,
+  caseStatusPollTimer: null,
   jobsRefreshInFlight: false,
   openLogJobId: null,
 };
@@ -175,6 +176,27 @@ async function api(path, { method = "GET", body, headers = {}, raw = false } = {
 async function downloadAuthenticated(url, filename) {
   const resp = await api(url, { raw: true });
   const blob = await resp.blob();
+  const objectUrl = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = objectUrl;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(objectUrl), 4000);
+}
+
+// For data already fetched client-side (IOC scan results), building and
+// downloading the CSV directly avoids both a redundant backend round-trip
+// and the URL-length limits a long pasted IOC list could hit on a
+// GET-based export endpoint.
+function downloadClientCsv(filename, headers, rows) {
+  const escapeCell = (v) => {
+    const s = v === null || v === undefined ? "" : String(v);
+    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const lines = [headers, ...rows].map((r) => r.map(escapeCell).join(","));
+  const blob = new Blob([lines.join("\r\n")], { type: "text/csv;charset=utf-8" });
   const objectUrl = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = objectUrl;
@@ -492,6 +514,46 @@ async function openCase(caseId) {
   state.machines = machines;
   renderCaseSidebar();
   renderMachinesView();
+  startCaseStatusPoller();
+}
+
+function startCaseStatusPoller() {
+  clearInterval(state.caseStatusPollTimer);
+  const caseId = state.currentCase.id;
+  state.caseStatusPollTimer = setInterval(async () => {
+    if (!state.currentCase || state.currentCase.id !== caseId) {
+      clearInterval(state.caseStatusPollTimer);
+      return;
+    }
+    if (!state.machines.some((m) => m.status === "ingesting")) {
+      // Nothing in flight -- stop polling rather than hit the API forever
+      // for no reason. startIngest() calls startCaseStatusPoller() again
+      // whenever a new ingest kicks off, so this isn't a dead end.
+      clearInterval(state.caseStatusPollTimer);
+      return;
+    }
+    try {
+      const fresh = await api(`/cases/${caseId}/machines`);
+      if (!state.currentCase || state.currentCase.id !== caseId) return;
+      const changed = fresh.some((fm) => {
+        const prev = state.machines.find((m) => m.id === fm.id);
+        return !prev || prev.status !== fm.status;
+      });
+      state.machines = fresh;
+      if (state.currentMachine) {
+        const updated = fresh.find((m) => m.id === state.currentMachine.id);
+        if (updated) state.currentMachine = updated;
+      }
+      if (changed) {
+        renderCaseSidebar();
+        if (!state.currentMachine && document.getElementById("machines-grid")) {
+          renderMachinesView();
+        }
+      }
+    } catch (_) {
+      // Non-critical; next tick retries.
+    }
+  }, 5000);
 }
 
 function sidebarHeader() {
@@ -575,7 +637,7 @@ function renderCaseSidebar() {
 
 function highlightActive() {
   document.querySelectorAll(".sidebar .cat[data-machine]").forEach((n) => n.classList.toggle("active", state.currentMachine && n.dataset.machine === state.currentMachine.id && !state.currentCategory));
-  document.querySelectorAll(".sidebar .cat[data-cat]").forEach((n) => n.classList.toggle("active", n.dataset.cat === state.currentCategory && !state.currentTable));
+  document.querySelectorAll(".sidebar .cat[data-cat]").forEach((n) => n.classList.toggle("active", n.dataset.cat === state.currentCategory));
   document.querySelectorAll(".sidebar .special").forEach((n) => n.classList.remove("active"));
 }
 
@@ -782,10 +844,17 @@ function renderMachineOverview() {
 }
 
 // Category landing view (the "kind" picker)
-function selectCategory(catKey) {
+async function selectCategory(catKey) {
   state.currentCategory = catKey;
   state.currentTable = null;
   highlightActive();
+  const main = document.getElementById("main");
+  main.innerHTML = `<div class="subtitle">Loading...</div>`;
+  try {
+    state.categories = await api(`/cases/${state.currentCase.id}/machines/${state.currentMachine.id}/artifacts/categories`);
+  } catch (_) {
+    // Non-critical -- fall back to whatever's already cached in state.categories.
+  }
   renderCategoryView();
 }
 
@@ -1171,7 +1240,7 @@ async function mountAiConversation(host, { conversationKey, askExtra, templates,
     try {
       const resp = await api(`/cases/${state.currentCase.id}/ai/ask`, {
         method: "POST",
-        body: { ...aiRequestBase(cfgNow), conversation_key: conversationKey, question, ...askExtra },
+        body: { ...aiRequestBase(cfgNow), conversation_key: conversationKey, question, ...(typeof askExtra === "function" ? askExtra() : askExtra) },
       });
       statusEl.textContent = resp.truncated ? "Context was truncated to fit the model." : "";
       const thread = document.getElementById("aic-thread");
@@ -1215,6 +1284,7 @@ async function renderCorrelationView() {
       <div id="corr-search-box" class="query-box-wrap"></div>
       <label style="font-size:12px;color:var(--text-dim);white-space:nowrap"><input type="checkbox" id="corr-cs" style="width:auto"/> case sensitive</label>
       <button class="primary" id="corr-run">Search</button>
+      <button id="corr-export">Download CSV</button>
     </div>
     <div class="hint query-hint">${queryHintText(true)}</div>
     <div class="form-row">
@@ -1249,6 +1319,19 @@ async function renderCorrelationView() {
     onSearch: run,
   });
   document.getElementById("corr-run").addEventListener("click", () => run());
+  document.getElementById("corr-export").addEventListener("click", () => {
+    const q = qb.getValue();
+    if (!q) { alert("Run a search first."); return; }
+    const machineIds = Array.from(document.querySelectorAll("#corr-machines input:checked")).map((n) => n.value);
+    const params = new URLSearchParams();
+    params.set("query", q);
+    params.set("case_sensitive", document.getElementById("corr-cs").checked ? "true" : "false");
+    machineIds.forEach((id) => params.append("machine_ids", id));
+    downloadAuthenticated(
+      `/cases/${state.currentCase.id}/correlation/export.csv?${params.toString()}`,
+      "correlation_results.csv",
+    );
+  });
 }
 
 // IOC scan
@@ -1262,6 +1345,7 @@ async function renderIocScanView() {
     <div class="toolbar">
       <label style="font-size:12px;color:var(--text-dim);white-space:nowrap"><input type="checkbox" id="ioc-cs" style="width:auto"/> case sensitive</label>
       <button class="primary" id="ioc-run">Scan</button>
+      <button id="ioc-export">Download CSV</button>
     </div>
     <div class="form-row">
       <label>Restrict to machines (none checked = scan all)</label>
@@ -1271,6 +1355,7 @@ async function renderIocScanView() {
     </div>
     <div id="ioc-results"></div>
   `;
+  let lastScanResult = null;
   document.getElementById("ioc-run").addEventListener("click", async () => {
     const iocsText = document.getElementById("ioc-text").value;
     if (!iocsText.trim()) return;
@@ -1285,6 +1370,7 @@ async function renderIocScanView() {
           machine_ids: machineIds.length ? machineIds : null, max_hits_per_ioc: 200,
         },
       });
+      lastScanResult = result;
       resultsEl.innerHTML = `<div class="subtitle">${result.matched_iocs} of ${result.scanned_iocs} indicator(s) matched something</div>`;
       if (result.groups.length === 0) {
         resultsEl.appendChild(el(`<div class="empty-state">No matches.</div>`));
@@ -1316,6 +1402,23 @@ async function renderIocScanView() {
       resultsEl.innerHTML = `<div class="hint">Error: ${ex.message}</div>`;
     }
   });
+  document.getElementById("ioc-export").addEventListener("click", () => {
+    if (!lastScanResult || lastScanResult.groups.length === 0) {
+      alert("Run a scan with at least one match first.");
+      return;
+    }
+    const rows = [];
+    lastScanResult.groups.forEach((group) => {
+      group.hits.forEach((hit) => {
+        rows.push([group.ioc, hit.machine_label, hit.table_label, hit.matched_column, JSON.stringify(hit.row)]);
+      });
+    });
+    downloadClientCsv(
+      "ioc_scan_results.csv",
+      ["IOC", "Machine", "Table", "Matched Column", "Row Data (JSON)"],
+      rows,
+    );
+  });
 }
 
 // Timeline
@@ -1333,6 +1436,7 @@ async function renderTimelineView() {
     <div class="toolbar">
       <div id="tl-search-box" class="query-box-wrap"></div>
       <button class="primary" id="tl-run">Apply</button>
+      <button id="tl-export">Download CSV</button>
     </div>
     <div class="hint query-hint">${queryHintText(true)}</div>
     <div class="toolbar">
@@ -1361,6 +1465,26 @@ async function renderTimelineView() {
     fields: tlFields, crossTable: true,
     placeholder: "Filter by any column, or artifact.column contains value and artifact2.column2 = value2...",
     onSearch: () => run(1),
+  });
+
+  document.getElementById("tl-export").addEventListener("click", () => {
+    const machineIds = Array.from(document.querySelectorAll("#tl-machines input:checked")).map((n) => n.value);
+    const categories = Array.from(document.querySelectorAll("#tl-categories input:checked")).map((n) => n.value);
+    const startVal = document.getElementById("tl-start").value;
+    const endVal = document.getElementById("tl-end").value;
+    const queryVal = qb.getValue();
+    const params = new URLSearchParams();
+    machineIds.forEach((id) => params.append("machine_ids", id));
+    categories.forEach((c) => params.append("categories", c));
+    if (queryVal) params.set("query", queryVal);
+    if (startVal) params.set("start", new Date(startVal).toISOString());
+    if (endVal) params.set("end", new Date(endVal).toISOString());
+    const filtered = machineIds.length || categories.length || queryVal || startVal || endVal;
+    const qs = params.toString();
+    downloadAuthenticated(
+      `/cases/${state.currentCase.id}/timeline/export.csv${qs ? `?${qs}` : ""}`,
+      filtered ? "timeline_filtered.csv" : "timeline.csv",
+    );
   });
 
   const run = async (page = 1) => {
@@ -1479,6 +1603,11 @@ async function renderAIView() {
           ${readyMachines.map((m) => `<option value="${m.id}">${m.label} only</option>`).join("")}
         </select>
       </div>
+      <div class="form-row">
+        <label>Rows per table</label>
+        <input id="ai-rows-per-table" type="number" min="1" max="5000" value="500" style="width:120px" />
+        <div class="hint">Higher gives the AI more to work with, at the cost of a slower, larger request -- lower this if your endpoint's context window is small.</div>
+      </div>
       <div id="ai-broad-host"></div>
     </div>
   `;
@@ -1487,7 +1616,10 @@ async function renderAIView() {
     const host = document.getElementById("ai-broad-host");
     mountAiConversation(host, {
       conversationKey: machineId ? `broad:${machineId}` : "broad:case",
-      askExtra: { machine_id: machineId || null },
+      askExtra: () => ({
+        machine_id: machineId || null,
+        max_rows_per_table: Number(document.getElementById("ai-rows-per-table").value) || 500,
+      }),
       templates: DFIR_PROMPT_TEMPLATES,
     });
   };
@@ -1611,7 +1743,7 @@ async function renderIngestWizard() {
       <div class="form-row" id="exclude-parsers-row">
         <label>Skip specific parsers (optional)</label>
         <div class="chip-box">
-          ${availableParsers.length ? availableParsers.map((p) => `<label class="chip"><input type="checkbox" class="exclude-parser-chk" value="${escapeAttr(p)}" style="width:auto"/> ${escapeHtml(p)}</label>`).join("") : `<span class="hint">Parser list unavailable (Triager.exe not found on the server).</span>`}
+          ${availableParsers.length ? availableParsers.map((p) => `<label class="chip"><input type="checkbox" class="exclude-parser-chk" value="${escapeAttr(p)}" style="width:auto"/> ${escapeHtml(p)}</label>`).join("") : `<span class="hint">Parser list unavailable.</span>`}
         </div>
       </div>
       <div class="form-row">
@@ -1723,6 +1855,7 @@ async function startIngest() {
         },
       });
       await openMachine(machineId);
+      startCaseStatusPoller();
     } catch (ex) {
       progressEl.textContent = `Failed to start ingest: ${ex.message}`;
     }
@@ -1739,14 +1872,32 @@ async function renderIngestProgress() {
   main.innerHTML = `
     <div class="breadcrumb"><a href="#" id="bc-machines">Machines</a> / ${state.currentMachine.label}</div>
     <h2>Ingest jobs -- ${state.currentMachine.label}</h2>
+    <div id="host-identity-panel"></div>
     <div id="partial-artifacts-panel"></div>
     <div id="jobs-list"></div>
   `;
   document.getElementById("bc-machines").addEventListener("click", (e) => { e.preventDefault(); state.currentMachine = null; renderCaseSidebar(); renderMachinesView(); });
   clearInterval(state.jobPollTimer);
+  renderHostIdentityPanel();
   renderPartialArtifactsPanel();
   await refreshJobs();
   state.jobPollTimer = setInterval(refreshJobs, 3000);
+}
+
+function renderHostIdentityPanel() {
+  const panel = document.getElementById("host-identity-panel");
+  if (!panel) return;
+  const m = state.currentMachine;
+  if (!m.hostname && !m.operating_system) {
+    panel.innerHTML = "";
+    return;
+  }
+  const parts = [m.hostname, m.operating_system, m.timezone].filter(Boolean);
+  panel.innerHTML = `
+    <div class="panel" style="margin-bottom:14px; border-left-color: var(--accent)">
+      <b>Host identified:</b> ${parts.map(escapeHtml).join(" &middot; ")}
+    </div>
+  `;
 }
 
 // Shows a "browse what's already imported" link while ingest is still in
@@ -1806,6 +1957,21 @@ async function refreshJobs() {
       } catch (_) {
         // Non-critical, job status/log polling below still proceeds either way.
       }
+      try {
+        const fresh = await api(`/cases/${state.currentCase.id}/machines/${machineId}`);
+        const hostChanged = fresh.hostname !== state.currentMachine.hostname
+          || fresh.operating_system !== state.currentMachine.operating_system
+          || fresh.timezone !== state.currentMachine.timezone;
+        if (hostChanged) {
+          state.currentMachine = fresh;
+          const idx = state.machines.findIndex((mm) => mm.id === machineId);
+          if (idx >= 0) state.machines[idx] = fresh;
+          renderHostIdentityPanel();
+          renderCaseSidebar();
+        }
+      } catch (_) {
+        // Non-critical; host identity will still show up once the ingest finishes either way.
+      }
     }
 
     jobsList.innerHTML = "";
@@ -1850,6 +2016,7 @@ async function refreshJobs() {
     state.currentMachine = m;
     const idx = state.machines.findIndex((mm) => mm.id === machineId);
     if (idx >= 0) state.machines[idx] = m;
+    renderCaseSidebar();
 
     if (m.status === "ready") {
       const banner = el(`<div class="panel" id="ingest-outcome-banner" style="margin-top:12px"><button class="primary" id="go-browse">Ingest complete -- view artifacts &rarr;</button></div>`);
@@ -2161,8 +2328,15 @@ async function renderUsersView() {
   document.getElementById("sidebar").style.display = "none";
   main.innerHTML = `<h2>Users</h2><div class="subtitle">Loading...</div>`;
   const users = await api("/users");
+  let systemInfo = null;
+  try {
+    systemInfo = await api("/system/info");
+  } catch (_) {
+    // non-admin or endpoint unavailable; just skip the storage-location panel
+  }
   main.innerHTML = `
     <h2>Users</h2>
+    ${systemInfo ? `<div class="panel" style="max-width:640px; margin-bottom:14px"><b>Data storage location:</b> <code>${escapeHtml(systemInfo.data_dir)}</code><div class="hint">Case data, uploads, and the app database all live here${systemInfo.packaged ? " -- back this folder up to keep your cases." : "."}</div></div>` : ""}
     <div class="toolbar"><button class="primary" id="new-user-btn">+ New user</button></div>
     <div class="table-scroll">
       <table class="data-table">

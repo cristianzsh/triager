@@ -232,6 +232,24 @@ def field_catalog(
         conn.close()
 
 
+def _value_matches_case_sensitive(op: str, cell_value, needle: str) -> bool:
+    """SQLite's LIKE is case-insensitive by default, so a case_sensitive=True
+    request still needs this Python-level re-check against the actual cell
+    value for the ops that compile to LIKE/NOT LIKE. = and != already do a
+    byte-wise (case-sensitive) comparison at the SQL level, so they don't
+    need this."""
+    cell = "" if cell_value is None else str(cell_value)
+    if op == "contains":
+        return needle in cell
+    if op == "not_contains":
+        return needle not in cell
+    if op == "startswith":
+        return cell.startswith(needle)
+    if op == "endswith":
+        return cell.endswith(needle)
+    return True
+
+
 def correlate_query(
     case_id: str,
     query_text: str,
@@ -281,7 +299,13 @@ def correlate_query(
                     real_col = _resolve_column(cond.column, columns)
                     if not real_col:
                         continue
-                    frag, params = query_lang.condition_sql(cond.op, real_col, cond.value)
+                    op_value = cond.value
+                    if cond.op == "regex" and not case_sensitive:
+                        # REGEXP's registered function (_regexp below) is
+                        # always case-sensitive regardless of this flag --
+                        # an inline (?i) makes it respect case_sensitive=False.
+                        op_value = f"(?i){cond.value}"
+                    frag, params = query_lang.condition_sql(cond.op, real_col, op_value)
                 else:
                     or_parts = [f'"{c}" LIKE ?' for c in columns]
                     frag = "(" + " OR ".join(or_parts) + ")"
@@ -297,9 +321,15 @@ def correlate_query(
                 meta = meta_by_table.get(table, {})
                 for r in rows:
                     row_dict = dict(r)
-                    matched_col = cond.column or _first_matching_column(row_dict, columns, cond.value, case_sensitive)
-                    if case_sensitive and cond.op in ("contains", "not_contains") and not matched_col:
-                        continue
+                    if cond.column:
+                        matched_col = cond.column
+                        if case_sensitive and cond.op in ("contains", "not_contains", "startswith", "endswith"):
+                            if not _value_matches_case_sensitive(cond.op, row_dict.get(real_col), cond.value):
+                                continue
+                    else:
+                        matched_col = _first_matching_column(row_dict, columns, cond.value, case_sensitive)
+                        if case_sensitive and cond.op in ("contains", "not_contains") and not matched_col:
+                            continue
                     cond_hits.append({
                         "table": table,
                         "table_label": meta.get("table_label") or table,

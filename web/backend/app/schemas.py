@@ -220,7 +220,7 @@ class AIAnalysisRequest(BaseModel):
     machine_id: Optional[str] = None     # restrict context to one machine (None = whole case)
     tables: Optional[list[str]] = None   # which artifact tables to include as context
     query: Optional[str] = None          # structured or plain query, same syntax as table search
-    max_rows_per_table: int = 150
+    max_rows_per_table: int = 500
     history_turns: int = 10   # how many prior Q/A pairs from this conversation to include for continuity
 
 

@@ -38,12 +38,6 @@ class Settings(BaseSettings):
     access_token_expire_minutes: int = 60 * 12
 
     # Triager binary
-    # Point this at the platform-appropriate build produced by Triager's
-    # build.sh. Defaults resolve to backend/tools/ in a source checkout, or
-    # the bundled tools/ folder next to a packaged desktop build (see
-    # desktop/README.md), override with an absolute path if it lives
-    # elsewhere. Resolved at job-run time; can be overridden per-request too.
-    # Windows-only: Triager is currently only built for Windows.
     triager_exe_path: str = str(_tools_dir / "Triager.exe")
 
     # Ingestion limits

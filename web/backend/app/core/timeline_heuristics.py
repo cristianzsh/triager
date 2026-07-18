@@ -58,6 +58,13 @@ _EXPLICIT_FORMATS = (
 _FILETIME_RE = re.compile(r"^\d{17,19}$")  # raw Windows FILETIME, occasionally left unconverted
 
 
+_BARE_NUMBER_RE = re.compile(r"^-?\d{1,7}$")  # short digit-only string, no date-like structure at all
+# Triager collects evidence from real machines, not time travelers or sci-fi
+# props -- any parsed date outside this range almost certainly means the
+# heuristic misfired on a non-timestamp value, not a genuine old/future date.
+_MIN_YEAR, _MAX_YEAR = 1990, 2100
+
+
 def try_parse_datetime(value: str) -> Optional[datetime]:
     """Best-effort parse of one cell's value into a timezone-aware UTC
     datetime. Returns None (not an exception) on anything that doesn't
@@ -79,18 +86,37 @@ def try_parse_datetime(value: str) -> Optional[datetime]:
             pass
         return None
 
+    # A bare short number (e.g. a LogonType/EventID/RunCount-style enum or
+    # code value, "5", "284"...) has none of the structure a real date
+    # string would (no separators, no month name, not a long enough digit
+    # run to be a known numeric timestamp format like epoch/FILETIME
+    # above). dateutil.parser will still happily "parse" it below by
+    # treating it as a day-of-month or year and silently defaulting every
+    # other field to today's date -- exactly how a non-timestamp column
+    # produces a nonsense date like year 284. Reject it before that ever
+    # gets a chance to run.
+    if _BARE_NUMBER_RE.match(v):
+        return None
+
+    parsed = None
     for fmt in _EXPLICIT_FORMATS:
         try:
             dt = datetime.strptime(v, fmt)
-            return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+            parsed = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+            break
         except ValueError:
             continue
 
-    try:
-        dt = dateutil_parser.parse(v, fuzzy=False)
-        return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
-    except (ValueError, OverflowError, TypeError):
+    if parsed is None:
+        try:
+            dt = dateutil_parser.parse(v, fuzzy=False)
+            parsed = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+        except (ValueError, OverflowError, TypeError):
+            return None
+
+    if parsed is not None and not (_MIN_YEAR <= parsed.year <= _MAX_YEAR):
         return None
+    return parsed
 
 
 def sample_parse_rate(values: list[str]) -> float:

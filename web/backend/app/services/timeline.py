@@ -157,6 +157,8 @@ def _timeline_condition_group(parsed, table_label: str, columns: list[str]) -> t
     label_norm = query_lang.normalize_label(table_label)
     applicable = [c for c in parsed.conditions if not c.table or query_lang.normalize_label(c.table) == label_norm]
     if not applicable:
+        if parsed.conditions and all(c.table for c in parsed.conditions):
+            return "1=0", []
         return "", []
 
     lower_map = {c.lower(): c for c in columns}

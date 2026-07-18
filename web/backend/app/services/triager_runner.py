@@ -1,20 +1,10 @@
 """
-Runs the actual Triager binary against an extracted evidence collection.
-
-This is intentionally a thin wrapper around the exact CLI Triager already
-exposes (see triager.py's parse_args()) rather than re-implementing any
-forensic parsing logic in the web app, Triager remains the single source
-of truth for artifact processing. The web layer's job is orchestration:
-queueing, running as a background job, tailing output, and updating the
-Job row so the UI can show progress.
-
-Windows-only: Triager is currently only built for Windows (Triager.exe).
-Resolved via resolve_triager_exe(): the configured settings.triager_exe_path
-if that exact file exists, otherwise falls back to the system PATH.
+Runs Triager's own CLI mode against an extracted evidence collection.
 """
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import datetime as dt
 from pathlib import Path
@@ -31,20 +21,32 @@ EXPECTED_PARSER_COUNT = 30
 RUNNING_RE = re.compile(r"\[INFO\]\s+Running:\s+(.+)")
 
 
-def resolve_triager_exe() -> str:
-    """settings.triager_exe_path defaults to a specific file
-    (backend/tools/Triager.exe or the packaged app's equivalent).
+def resolve_triager_command() -> list[str]:
     """
+    Returns the argv prefix used to invoke Triager's CLI as a subprocess.
+
+    - Frozen (this is the merged Triager Console binary): Triager's CLI
+      mode lives in this exact same executable, just without --web --
+      so re-invoke ourselves.
+    - Dev/unfrozen: find the actual triager.py at the repo root and run
+      it with the same Python interpreter this server is running under.
+    - Neither of those (e.g. a standalone web-only deployment with no
+      merged binary and no sibling triager.py checkout): fall back to
+      settings.triager_exe_path, or the system PATH.
+    """
+    if getattr(sys, "frozen", False):
+        return [sys.executable]
+
+    triager_py = Path(__file__).resolve().parents[4] / "triager.py"
+    if triager_py.exists():
+        return [sys.executable, str(triager_py)]
+
     configured = settings.triager_exe_path
     if Path(configured).is_file():
-        return configured
+        return [configured]
 
     found = shutil.which(configured) or shutil.which("Triager.exe") or shutil.which("Triager")
-    if found:
-        return found
-
-    return configured  # let the caller's own error handling report the failure
-
+    return [found] if found else [configured]
 
 PARSER_NAMES = [
     "AmCache",
@@ -138,8 +140,9 @@ def run_triager(
         _set_job(db, job_id, status=JobStatus.running, started_at=dt.datetime.utcnow(),
                   log_path=str(log_path), message="Launching Triager")
 
-        cmd = [resolve_triager_exe(), "--root", str(evidence_root), "-o", str(output_dir),
-               "--workers", str(workers or 0)]
+        cmd = resolve_triager_command() + [
+            "--root", str(evidence_root), "-o", str(output_dir), "--workers", str(workers or 0),
+        ]
         if config_path:
             cmd += ["-c", str(config_path)]
         else:

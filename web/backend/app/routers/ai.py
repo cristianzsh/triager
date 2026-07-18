@@ -1,4 +1,5 @@
 import json
+import time
 from typing import Optional
 
 import requests
@@ -26,19 +27,97 @@ def get_ai_defaults():
 
 router = APIRouter(prefix="/cases/{case_id}/ai", tags=["ai"])
 
-MAX_CONTEXT_CHARS = 180_000
+MAX_CONTEXT_CHARS = 700_000
+MAX_TABLE_SNIPPET_CHARS = 150_000
+MAX_ROWS_PER_TABLE_CEILING = 5_000
+
+_CATEGORY_WEIGHTS = {
+    "execution_evidence": 4.0,  # Amcache, Prefetch, SRUM, WER, PCA -- what ran, when
+    "persistence": 3.0,         # ScheduledTasks, WMI -- how it stays around
+    "registry": 3.0,            # Shimcache, BAM/DAM, USB -- also execution/device evidence
+    "user_artifacts": 2.0,      # UserAssist, JumpLists, browser history, etc.
+    "filesystem": 1.5,          # MFT, USN Journal, LogFile, RecycleBin
+    "event_logs": 1.0,
+    "meta": 0.5,
+}
+_DEFAULT_CATEGORY_WEIGHT = 1.0
+_LOW_VALUE_EVENTLOG_PREFIX = "evtxecmd"
+_MIN_TABLE_BUDGET_CHARS = 2_000
+
+
+def _table_weight(category: str, table_label: str) -> float:
+    weight = _CATEGORY_WEIGHTS.get(category, _DEFAULT_CATEGORY_WEIGHT)
+    if category == "event_logs" and (table_label or "").lower().startswith(_LOW_VALUE_EVENTLOG_PREFIX):
+        weight *= 0.25
+    return weight
 SYSTEM_PROMPT = (
     "You are a DFIR forensic analyst assistant helping investigate a case. "
     "You are given structured forensic artifact data (Prefetch, Event Logs, "
     "Registry, Scheduled Tasks, browser/user activity, etc.) extracted by the "
     "Triager tool, possibly from multiple machines in the same case (each "
-    "table's context notes which machine it came from). Only reason from "
-    "the evidence provided; if something is not present in the context, say "
-    "so explicitly rather than guessing. When you flag something as "
-    "suspicious, cite the specific machine/table/row/field. You may be "
-    "shown earlier turns of this same conversation for continuity -- treat "
-    "them as prior context, not as new evidence to re-verify."
+    "table's context notes which machine it came from). Columns that were "
+    "entirely empty across every shown row for a table have been removed "
+    "from that table's rows to save space -- their absence means no value "
+    "was present in the sample, not that the field wasn't collected. Only "
+    "reason from the evidence provided; if something is not present in the "
+    "context, say so explicitly rather than guessing. When you flag "
+    "something as suspicious, cite the specific machine/table/row/field. "
+    "You may be shown earlier turns of this same conversation for "
+    "continuity -- treat them as prior context, not as new evidence to "
+    "re-verify."
 )
+
+_MAX_CELL_CHARS = 500
+_EMPTY_SENTINELS = {"none", "null", "n/a", "na", "-", "0001-01-01t00:00:00", "0001-01-01 00:00:00"}
+
+
+def _is_empty_value(v) -> bool:
+    if v is None:
+        return True
+    if not isinstance(v, str):
+        return False
+    s = v.strip()
+    if not s:
+        return True
+    normalized = s.lower().replace(".0000000", "").rstrip("z")
+    return normalized in _EMPTY_SENTINELS
+
+
+def _prune_empty_columns(rows: list[dict]) -> list[dict]:
+    """Drops columns that are entirely empty/null (or filled with common
+    placeholder sentinels like a blank .NET DateTime) across every row in
+    this page. Purely data-driven -- no per-artifact-type knowledge
+    needed, and strictly safe: a column with zero populated values across
+    the whole sample carries zero information for the AI to lose.
+    Forensic CSV exports routinely have 20-40 columns where only a
+    handful are ever populated for a given artifact, so this alone often
+    cuts payload size substantially without touching anything that's
+    actually informative."""
+    if not rows:
+        return rows
+    keys = rows[0].keys()
+    populated = {k for k in keys if any(not _is_empty_value(r.get(k)) for r in rows)}
+    if len(populated) == len(keys):
+        return rows
+    return [{k: v for k, v in r.items() if k in populated} for r in rows]
+
+
+def _truncate_long_values(rows: list[dict]) -> list[dict]:
+    """Truncates individual cell values that are unusually long (raw binary
+    blobs rendered as hex/base64, huge paths) rather than letting one
+    field crowd out the rest of its row -- and every other row's share of
+    the table's budget -- for a value that's rarely the forensically
+    relevant part anyway."""
+    out = []
+    for r in rows:
+        new_row = {}
+        for k, v in r.items():
+            if isinstance(v, str) and len(v) > _MAX_CELL_CHARS:
+                new_row[k] = v[:_MAX_CELL_CHARS] + "...(truncated)"
+            else:
+                new_row[k] = v
+        out.append(new_row)
+    return out
 
 
 @router.get("/history", response_model=list[AIMessageOut])
@@ -67,6 +146,107 @@ def delete_history(case_id: str, conversation_key: str, db: Session = Depends(ge
     return {"ok": True}
 
 
+def _fit_rows_to_budget(rows: list[dict], budget: int) -> tuple[list[dict], bool]:
+    """Returns as many whole rows as fit within budget characters of
+    serialized JSON, never a partial row. Slicing the serialized JSON
+    string directly at a character boundary (the previous approach) can
+    cut off mid-object and hand the model syntactically invalid JSON with
+    no indication anything's wrong -- this guarantees what's included is
+    always a complete, parseable array."""
+    if not rows:
+        return rows, False
+    full_len = len(json.dumps(rows, ensure_ascii=False))
+    if full_len <= budget:
+        return rows, False
+    lo, hi = 0, len(rows)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if len(json.dumps(rows[:mid], ensure_ascii=False)) <= budget:
+            lo = mid
+        else:
+            hi = mid - 1
+    return rows[:lo], True
+
+
+def _build_context(case_id: str, payload: AIAnalysisRequest, db: Session) -> tuple[str, bool, list[str]]:
+    """Builds the "CASE ARTIFACT CONTEXT: ...\\n\\nQUESTION: ..." text that
+    gets sent as the current turn's content."""
+    rows_per_table = max(1, min(payload.max_rows_per_table, MAX_ROWS_PER_TABLE_CEILING))
+
+    if payload.tables:
+        tables = payload.tables
+    else:
+        tables = case_db.list_tables(case_id, machine_id=payload.machine_id)
+
+    context_parts = []
+    truncated = False
+    used_tables = []
+
+    table_labels = _table_label_map(case_id)
+
+    weights = {
+        t: _table_weight(table_labels.get(t, {}).get("category", ""), table_labels.get(t, {}).get("table_label", t))
+        for t in tables
+    }
+    tables = sorted(tables, key=lambda t: weights[t], reverse=True)
+    total_weight = sum(weights.values()) or 1.0
+
+    def _budget_for(table: str) -> int:
+        share = MAX_CONTEXT_CHARS * (weights[table] / total_weight)
+        return int(min(MAX_TABLE_SNIPPET_CHARS, max(_MIN_TABLE_BUDGET_CHARS, share)))
+
+    for table in tables:
+        try:
+            page = case_db.get_table_page(
+                case_id, table, page=1, page_size=rows_per_table, query=payload.query
+            )
+        except ValueError:
+            continue
+        if not page["rows"]:
+            continue  # nothing to show; a header with an empty array wastes budget for zero information
+        meta = table_labels.get(table, {})
+        label = meta.get("table_label") or table
+        machine_label = meta.get("machine_label") or "unknown machine"
+        rows = _truncate_long_values(_prune_empty_columns(page["rows"]))
+        fitted_rows, row_level_truncated = _fit_rows_to_budget(rows, _budget_for(table))
+        if not fitted_rows:
+            # Even a single row doesn't fit this table's share of the
+            # budget (extremely wide rows, e.g. many long path columns) --
+            # skip rather than send something empty for a table label
+            # that promised data.
+            truncated = True
+            continue
+        if row_level_truncated:
+            truncated = True
+        snippet = json.dumps(fitted_rows, ensure_ascii=False)
+        filter_note = f" (filtered by \"{payload.query}\")" if payload.query else ""
+        shown_note = f" -- showing {len(fitted_rows)} of up to {rows_per_table} row(s)" if row_level_truncated else f" -- showing up to {rows_per_table} rows"
+        used_tables.append(table)
+        context_parts.append(
+            f"### Machine: {machine_label} | Table: {label} ({table}){filter_note}{shown_note}\n{snippet}"
+        )
+
+    # Safety net: even with the fair per-table split above, header text
+    # overhead across many tables could in principle still add up to
+    # slightly over budget. Trim whole table sections from the end rather
+    # than slicing mid-section like the per-table truncation used to --
+    # every section that makes it into the final blob is always complete.
+    included_parts = []
+    included_tables = []
+    total = 0
+    for table, part in zip(used_tables, context_parts):
+        part_len = len(part) + 2  # +2 for the "\n\n" joiner
+        if total + part_len > MAX_CONTEXT_CHARS and included_parts:
+            truncated = True
+            break
+        included_parts.append(part)
+        included_tables.append(table)
+        total += part_len
+    context_blob = "\n\n".join(included_parts)
+
+    return context_blob, truncated, included_tables
+
+
 @router.post("/ask", response_model=AIAnalysisResponse)
 def ask_ai(case_id: str, payload: AIAnalysisRequest, request: Request, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """
@@ -81,13 +261,6 @@ def ask_ai(case_id: str, payload: AIAnalysisRequest, request: Request, db: Sessi
     reopening the same page later shows the same conversation, and multiple
     pages (broad case analysis, one machine's analysis, each table's quick
     analysis) never mix history together.
-
-    Two calling patterns share this one endpoint:
-      - Broad analysis: no tables (or no machine_id) -> whole case, or
-        whole machine, becomes context.
-      - Quick per-table analysis: tables=[<one table>] plus the
-        investigator's current search term, so the AI sees exactly the
-        filtered view they're looking at on screen.
     """
     require_case_access(case_id, user, db, need_edit=True)
 
@@ -97,42 +270,13 @@ def ask_ai(case_id: str, payload: AIAnalysisRequest, request: Request, db: Sessi
     elif not payload.endpoint:
         raise HTTPException(400, "An endpoint is required when using a custom/local LLM provider")
 
-    if payload.tables:
-        tables = payload.tables
-    else:
-        tables = case_db.list_tables(case_id, machine_id=payload.machine_id)
+    context_blob, truncated, used_tables = _build_context(case_id, payload, db)
+    user_content = f"CASE ARTIFACT CONTEXT:\n{context_blob}\n\nQUESTION:\n{payload.question}"
 
-    context_parts = []
-    truncated = False
-    used_tables = []
-
-    table_labels = _table_label_map(case_id)
-
-    for table in tables:
-        try:
-            page = case_db.get_table_page(
-                case_id, table, page=1, page_size=payload.max_rows_per_table, query=payload.query
-            )
-        except ValueError:
-            continue
-        used_tables.append(table)
-        meta = table_labels.get(table, {})
-        label = meta.get("table_label") or table
-        machine_label = meta.get("machine_label") or "unknown machine"
-        snippet = json.dumps(page["rows"], ensure_ascii=False)
-        if len(snippet) > 40_000:
-            snippet = snippet[:40_000]
-            truncated = True
-        filter_note = f" (filtered by \"{payload.query}\")" if payload.query else ""
-        context_parts.append(
-            f"### Machine: {machine_label} | Table: {label} ({table}){filter_note} "
-            f"-- showing up to {payload.max_rows_per_table} rows\n{snippet}"
-        )
-
-    context_blob = "\n\n".join(context_parts)
-    if len(context_blob) > MAX_CONTEXT_CHARS:
-        context_blob = context_blob[:MAX_CONTEXT_CHARS]
-        truncated = True
+    # TEMP DEBUG -- prints the exact payload to the server terminal.
+    #print(f"\n===== AI PAYLOAD (case_id={case_id}, conversation_key={payload.conversation_key}) =====")
+    #print(user_content)
+    #print("===== END AI PAYLOAD =====\n")
 
     # Prior turns of this same conversation, for continuity. Only the
     # question/answer text is stored (not the artifact context each turn
@@ -153,8 +297,6 @@ def ask_ai(case_id: str, payload: AIAnalysisRequest, request: Request, db: Sessi
     db.add(job)
     db.commit()
     db.refresh(job)
-
-    user_content = f"CASE ARTIFACT CONTEXT:\n{context_blob}\n\nQUESTION:\n{payload.question}"
 
     try:
         if payload.provider == "claude":
@@ -187,6 +329,23 @@ def ask_ai(case_id: str, payload: AIAnalysisRequest, request: Request, db: Sessi
     db.commit()
 
     return AIAnalysisResponse(answer=answer, context_tables_used=used_tables, truncated=truncated)
+
+
+_RETRYABLE_STATUSES = {429, 503, 529}
+_MAX_RETRIES = 3
+_RETRY_BASE_DELAY = 2.0
+
+
+def _post_with_retry(url: str, **kwargs) -> requests.Response:
+    last_resp = None
+    for attempt in range(_MAX_RETRIES + 1):
+        resp = requests.post(url, **kwargs)
+        if resp.status_code not in _RETRYABLE_STATUSES:
+            return resp
+        last_resp = resp
+        if attempt < _MAX_RETRIES:
+            time.sleep(_RETRY_BASE_DELAY * (2 ** attempt))
+    return last_resp
 
 
 def _raise_for_status_with_body(resp: requests.Response, provider_name: str) -> None:
@@ -223,7 +382,7 @@ def _call_openai_compatible(
         body["max_tokens"] = max_tokens
 
     url = _normalize_openai_endpoint(endpoint)
-    resp = requests.post(url, headers=headers, data=json.dumps(body), timeout=300)
+    resp = _post_with_retry(url, headers=headers, data=json.dumps(body), timeout=300)
     _raise_for_status_with_body(resp, "The LLM endpoint")
     data = resp.json()
     return data["choices"][0]["message"]["content"]
@@ -259,7 +418,7 @@ def _call_claude(
         "system": SYSTEM_PROMPT,
         "messages": messages,
     }
-    resp = requests.post("https://api.anthropic.com/v1/messages", headers=headers, data=json.dumps(body), timeout=300)
+    resp = _post_with_retry("https://api.anthropic.com/v1/messages", headers=headers, data=json.dumps(body), timeout=300)
     _raise_for_status_with_body(resp, "Anthropic")
     data = resp.json()
     text_blocks = [b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"]
@@ -270,7 +429,7 @@ def _table_label_map(case_id: str) -> dict[str, dict]:
     conn = case_db.get_connection(case_id)
     try:
         case_db.ensure_meta_table(conn)
-        rows = conn.execute("SELECT table_name, table_label, machine_label FROM _artifact_meta").fetchall()
+        rows = conn.execute("SELECT table_name, table_label, machine_label, category FROM _artifact_meta").fetchall()
         return {r["table_name"]: dict(r) for r in rows}
     except Exception:
         return {}

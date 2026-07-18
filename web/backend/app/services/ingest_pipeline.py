@@ -9,19 +9,6 @@ pipeline the "Upload evidence" button triggers for a single machine:
                                                        case.sqlite (m_<machine_id>__*)
 
   processed.zip -(extract)-> triager_out/ -(CSV importer)-> case.sqlite
-
-After a successful import, Triager's own Meta/host_profile.json (written by
-collect_host_info_from_triage() in triager.py) is read back to populate the
-Machine's hostname/OS/IP/timezone fields, so the investigator doesn't have
-to type in host identity that's already sitting in the evidence.
-
-Runs entirely in one background thread per upload so the HTTP request that
-kicks it off returns immediately (this can legitimately take hours against
-a large evidence collection) while the UI polls /jobs for progress.
-
-Every stage (extract, Triager run, import) writes its own log file and sets
-Job.log_path, so "view log" always has something to show, not just the
-Triager-run stage.
 """
 import datetime as dt
 import json
@@ -187,15 +174,6 @@ def _run_pipeline(
             assert triager_job_id is not None
             triager_log = _job_log_path(case_id, machine_id, triager_job_id)
 
-            # Triager's own parsers write each artifact's CSV as soon as
-            # that parser finishes (run_selected_parsers() runs them
-            # concurrently), well before the whole process exits, often
-            # the longest single stage of the pipeline. Rather than making
-            # the investigator wait for all of it, periodically import
-            # whatever's already done in the background while Triager is
-            # still running; see csv_importer.import_incremental()'s
-            # docstring for why this is safe (never the final word, the
-            # full rebuild in Stage 3 always supersedes it).
             stop_incremental = threading.Event()
             incremental_thread = threading.Thread(
                 target=_run_incremental_import_loop,
@@ -230,8 +208,8 @@ def _run_pipeline(
                 _mark_machine_error(db, machine_id, "Triager run failed; see job log")
                 return
         else:
-            # Already-processed archive: the extracted root is the output dir.
             triager_out_dir = effective_root
+            _apply_host_profile(db, machine_id, triager_out_dir)
 
         # Stage 3: import CSVs into case.sqlite
         import_log = _job_log_path(case_id, machine_id, import_job_id)
@@ -319,21 +297,33 @@ def _run_incremental_import_loop(
     complete. Best-effort by design: any exception here is swallowed (the
     authoritative full import in Stage 3 will pick up anything missed or
     gotten wrong) rather than risking taking down the whole ingest over a
-    bonus feature."""
+    bonus feature.
+    """
     already_imported: set[str] = set()
-    # A short first wait, Triager needs a moment to even create the
-    # output directory, let alone finish a parser.
-    if stop_event.wait(10):
-        return
-    while not stop_event.is_set():
-        try:
-            already_imported = csv_importer.import_incremental(
-                case_id, machine_id, machine_label, table_prefix, output_dir, already_imported
-            )
-        except Exception:  # noqa: BLE001
-            pass
-        if stop_event.wait(20):
+    host_profile_applied = False
+    db = SessionLocal()
+    try:
+        # A short first wait, Triager needs a moment to even create the
+        # output directory, let alone finish a parser.
+        if stop_event.wait(10):
             return
+        while not stop_event.is_set():
+            try:
+                already_imported = csv_importer.import_incremental(
+                    case_id, machine_id, machine_label, table_prefix, output_dir, already_imported
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            if not host_profile_applied:
+                try:
+                    _apply_host_profile(db, machine_id, output_dir)
+                    host_profile_applied = (output_dir / "Meta" / "host_profile.json").exists()
+                except Exception:  # noqa: BLE001
+                    pass
+            if stop_event.wait(20):
+                return
+    finally:
+        db.close()
 
 
 def _mark_machine_error(db: Session, machine_id: str, message: str) -> None:
