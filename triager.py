@@ -2908,11 +2908,8 @@ def _extract_zip_to_temp(
 ) -> Path:
     """
     Extract ZIP to a unique temp directory and return the extracted root.
-    If skip_large_files is set, any member whose recorded (uncompressed)
-    size exceeds max_file_size_bytes is never written to disk at all --
-    zipfile.ZipInfo.file_size is available from the archive's own central
-    directory, so this is a free check that costs nothing extra to make
-    before deciding whether to extract.
+    If skip_large_files is set, any member over max_file_size_bytes is
+    never written to disk (ZipInfo.file_size is free to check up front).
     """
 
     ensure_exists(zip_path, "ZIP file")
@@ -3317,14 +3314,10 @@ def _run_web_mode(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
-    # Double-clicking the packaged exe (or running it from a shortcut with
-    # no arguments) has no CLI invocation to fall back to -- previously
-    # this just hit argparse's "no root specified" error and the console
-    # window closed immediately, which looks like the program is simply
-    # broken to someone who isn't expecting a terminal tool. Default that
-    # specific case to the web console instead: --web's own default host
-    # (127.0.0.1) already means localhost-only, so this needs nothing
-    # beyond just turning --web on.
+    # Double-clicking the packaged exe has no CLI invocation to fall back
+    # to (previously: an argparse error and instant window close), so
+    # default to the web console -- its own --host default is already
+    # 127.0.0.1 (localhost-only).
     if len(sys.argv) == 1:
         sys.argv.append("--web")
 

@@ -83,10 +83,9 @@ def start_ingest(
 
         import_job_id = _new_job(db, case_id, machine_id, JobType.import_csv).id
 
-        # Read every id into a plain string before closing the session:
-        # each db.commit() above expires all objects in the session
-        # (SQLAlchemy's default expire_on_commit), so touching a Job
-        # attribute again after db.close() raises DetachedInstanceError.
+        # Ids read as plain strings before closing the session, since
+        # commit() expires objects and touching one after close() raises
+        # DetachedInstanceError.
         job_ids = [j for j in (extract_job_id, triager_job_id, import_job_id) if j]
     finally:
         db.close()
@@ -303,9 +302,7 @@ def _run_incremental_import_loop(
     host_profile_applied = False
     db = SessionLocal()
     try:
-        # A short first wait, Triager needs a moment to even create the
-        # output directory, let alone finish a parser.
-        if stop_event.wait(10):
+        if stop_event.wait(10):  # give Triager a moment to create the output dir
             return
         while not stop_event.is_set():
             try:

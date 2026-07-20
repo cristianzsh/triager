@@ -4,19 +4,17 @@ one machine at a time.
 
 Design choices:
   - Every column is stored as TEXT. Forensic CSV output is heterogeneous
-    (mixed date formats, hex, free text) and investigators need to see the
-    tool's raw output faithfully, type coercion happens at query time in
-    the UI, not at import time, so nothing is silently dropped or reinterpreted.
-  - Each artifact table gets a companion FTS5 virtual table (<table>_fts)
-    over all its columns, giving fast correlation search even over
-    multi-million-row MFT/event-log exports.
+    (mixed date formats, hex, free text); type coercion happens at query
+    time, not import time, so nothing is silently dropped or reinterpreted.
+  - Each artifact table gets a companion FTS5 table (<table>_fts) over
+    all its columns, for fast correlation search even over multi-million-
+    row exports.
   - Tables are namespaced per machine (m_<machine_id>__<artifact>) so one
-    case's database can hold many machines without name collisions, and
-    correlation across the whole case is a single query over that database.
-  - Import is streamed and batched (default 5000 rows/txn) so multi-GB CSVs
-    (MFT, USN Journal, EvtxECmd output) don't blow up memory.
+    case's database holds many machines without collisions.
+  - Import is streamed and batched (5000 rows/txn) so multi-GB CSVs don't
+    blow up memory.
   - Re-running import for a machine drops and recreates its tables so
-    re-imports after a corrected Triager run don't leave stale duplicate rows.
+    re-imports don't leave stale duplicate rows.
 """
 import csv
 import re
@@ -88,13 +86,10 @@ def import_output_dir(
     output_dir: Path,
     progress_cb: Optional[Callable[[str, int, int], None]] = None,
 ) -> dict:
-    """Returns a summary dict: {tables: [...], total_rows: N, skipped: [...]}.
-    Drops and recreates every table already tagged with this machine_id
-    before importing, so re-running ingest for a machine doesn't duplicate
-    or orphan tables from a previous attempt. This is the final,
-    authoritative import, it always supersedes whatever
-    import_incremental() may have already produced while Triager was still
-    running (see that function's docstring)."""
+    """Returns {tables: [...], total_rows: N, skipped: [...]}. Drops and
+    recreates every table tagged with this machine_id first, so re-ingest
+    doesn't duplicate rows. This is the final, authoritative import --
+    always supersedes whatever import_incremental() produced meanwhile."""
     from .case_db import delete_machine_data
     delete_machine_data(case_id, machine_id)
 
@@ -188,28 +183,20 @@ def import_incremental(
 ) -> set[str]:
     """
     Best-effort partial import, run periodically while Triager is still
-    executing (its own parsers write each artifact's CSV as soon as that
-    parser finishes, well before the whole run exits, see Triager's
-    run_selected_parsers()). This is what lets an investigator start
-    browsing whatever's already done instead of waiting for the entire,
-    potentially hours-long run to finish.
+    executing (each parser writes its CSV as soon as it finishes, well
+    before the whole run exits), so an investigator can start browsing
+    before the run completes.
 
-    Unlike import_output_dir(), this never wipes existing tables, it only
-    adds files not already in already_imported. A file is only imported
-    once it's been "quiet" (unchanged size/mtime) for quiet_seconds, a
-    cheap guard against reading a file Triager might still be mid-write on
-    (in practice these tools build each CSV's rows in memory and write it
-    in one shot, so a short quiet window is a comfortable safety margin,
-    not a tight race).
+    Unlike import_output_dir(), never wipes existing tables -- only adds
+    files not already in already_imported, and only once a file has been
+    "quiet" (unchanged size/mtime) for quiet_seconds, a cheap guard against
+    reading one Triager might still be writing.
 
-    This import is intentionally not the final word: once Triager's
-    process exits, import_output_dir() does a full, clean rebuild from
-    scratch (dropping and re-importing everything), so any file
-    successfully picked up here just becomes visible sooner, it's never
-    the only copy of the truth.
+    Not the final word: once Triager exits, import_output_dir() does a
+    full clean rebuild, so anything picked up here just becomes visible
+    sooner.
 
-    Returns the updated already_imported set (relative path strings) for
-    the caller to pass into the next call.
+    Returns the updated already_imported set for the next call.
     """
     conn = get_connection(case_id)
     ensure_meta_table(conn)
@@ -241,33 +228,24 @@ def _import_one_csv(conn: sqlite3.Connection, table: str, csv_path: Path) -> int
     """
     Imports one CSV, auto-detecting its text encoding.
 
-    A short-prefix probe (e.g. reading just the first 1KB) isn't reliable
-    here: UnicodeDecodeError positions are relative to whatever internal
-    read buffer was being decoded, not the absolute file offset, so a file
-    that looks fine for the first buffer can still fail later on, exactly
-    what happened with tool output like BrowsingHistoryView's CSVs (often
-    UTF-16, but with enough leading ASCII/NUL bytes to pass as valid UTF-8
-    for a while before a real non-ASCII byte shows up).
-
-    So detection is a full-file pass, but a cheap one: just decoding
-    text in large chunks, no CSV parsing or SQLite writes. Only once a
-    candidate encoding is confirmed to decode the whole file does the real
-    (row-by-row, batched-insert, FTS-building) import run, and it runs
-    exactly once. An earlier approach re-ran that expensive full import per
-    candidate encoding and rolled back on failure, correct, but on a
-    multi-GB artifact like MFT or the USN Journal, a wrong guess that only
-    failed deep into the file meant re-parsing and re-inserting everything
-    read so far, repeatedly, which could look like the ingest had hung for
-    a very long time rather than actually being slow.
+    A short-prefix probe isn't reliable here: decode errors are relative
+    to the internal read buffer, not the file offset, so a file can look
+    fine for a while (e.g. BrowsingHistoryView's UTF-16 CSVs, which pass
+    as valid UTF-8 until a real non-ASCII byte finally shows up) and still
+    fail later. So detection does a full-file pass, but a cheap one --
+    just decoding in large chunks, no CSV parsing or SQLite writes. Only
+    once an encoding is confirmed to decode the whole file does the real
+    import run, exactly once, rather than re-running the expensive
+    row-by-row import per candidate and rolling back on failure (which,
+    on a multi-GB artifact like MFT, could look like a hang if a wrong
+    guess failed deep into the file).
     """
     safe_ident(table)
     encoding = _detect_encoding(csv_path)
     errors = "strict" if encoding else "replace"
-    # Detection already proved the whole file decodes cleanly under this
-    # encoding (or, if every candidate failed, we fall back to UTF-8 with
-    # errors='replace', which can never raise, a CSV is never skipped
-    # outright over an encoding guess; worst case a handful of
-    # undecodable bytes become replacement characters).
+    # Detection already proved this encoding decodes cleanly, or (if every
+    # candidate failed) falls back to UTF-8/errors='replace', which never
+    # raises -- a CSV is never skipped outright over an encoding guess.
     return _import_one_csv_with_encoding(conn, table, csv_path, encoding or "utf-8", errors=errors)
 
 
@@ -355,14 +333,11 @@ def _import_one_csv_with_encoding(conn: sqlite3.Connection, table: str, csv_path
 
 def _detect_and_populate_timeline_columns(conn: sqlite3.Connection, table: str) -> None:
     """
-    For a just-imported table, finds columns that look like timestamps by
-    name (see core/timeline_heuristics.py), confirms them by sampling
-    actual values, and, for confirmed columns, adds a companion
-    "<col>__ts_epoch" REAL column holding each row's parsed Unix epoch
-    (UTC), computed once here rather than at query time. That's what lets
-    the unified timeline (services/timeline.py) do a real ORDER BY/range
-    filter in SQL across many heterogeneously-formatted tables instead of
-    parsing timestamps on every request.
+    Finds columns that look like timestamps by name (see
+    core/timeline_heuristics.py), confirms by sampling values, and adds a
+    "<col>__ts_epoch" REAL column with each row's parsed Unix epoch,
+    computed once here so the unified timeline can ORDER BY/range-filter
+    in SQL instead of parsing timestamps per request.
     """
     from ..core.timeline_heuristics import looks_like_timestamp_name, sample_parse_rate, try_parse_datetime
 

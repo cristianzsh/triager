@@ -112,11 +112,9 @@ def update_user(user_id: str, payload: UserUpdate, request: Request, db: Session
 def delete_user(user_id: str, request: Request, db: Session = Depends(get_db),
                  admin: User = Depends(require_role(Role.admin))):
     """
-    Permanently deletes a user account and their case memberships. Case
-    data they created/worked on is untouched, audit log entries and
-    findings keep a denormalized username snapshot, so history stays
-    readable even after the account is gone. You can't delete your own
-    account, and you can't delete the last remaining active admin.
+    Permanently deletes a user and their case memberships. Case data is
+    untouched; audit/findings keep a denormalized username snapshot so
+    history stays readable. Can't delete yourself or the last admin.
     """
     user = db.query(User).filter(User.id == user_id).first()
     if not user:

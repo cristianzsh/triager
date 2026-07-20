@@ -23,16 +23,11 @@ RUNNING_RE = re.compile(r"\[INFO\]\s+Running:\s+(.+)")
 
 def resolve_triager_command() -> list[str]:
     """
-    Returns the argv prefix used to invoke Triager's CLI as a subprocess.
-
-    - Frozen (this is the merged Triager Console binary): Triager's CLI
-      mode lives in this exact same executable, just without --web --
-      so re-invoke ourselves.
-    - Dev/unfrozen: find the actual triager.py at the repo root and run
-      it with the same Python interpreter this server is running under.
-    - Neither of those (e.g. a standalone web-only deployment with no
-      merged binary and no sibling triager.py checkout): fall back to
-      settings.triager_exe_path, or the system PATH.
+    Argv prefix to invoke Triager's CLI as a subprocess.
+    - Frozen (merged binary): re-invoke ourselves, just without --web.
+    - Dev: run triager.py at the repo root with this same interpreter.
+    - Neither (standalone web-only deployment): fall back to
+      settings.triager_exe_path or the system PATH.
     """
     if getattr(sys, "frozen", False):
         return [sys.executable]

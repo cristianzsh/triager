@@ -1,13 +1,10 @@
 """
-A triage config's paths get resolved by Triager as (root / value).resolve()
-against wherever that machine's evidence was extracted on the server (see
-triager.py's build_paths()). An uploaded config with a path like
-"../../../../etc/passwd" or an absolute path would make Triager read and
-copy in files from anywhere on disk it has permission to reach, not just
-the intended evidence, since Triager itself does no sandboxing. Since a
-web upload is fully untrusted input, this module is the boundary that
-keeps every path in an uploaded config confined to the triage root before
-it's ever handed to Triager.
+A triage config's paths get resolved by Triager as (root / value).resolve().
+An uploaded config with a path like "../../../../etc/passwd" or an
+absolute path would make Triager read/copy files from anywhere on disk
+it can reach, since Triager itself does no sandboxing. This module is
+the boundary that confines every path in an uploaded config to the
+triage root before it's ever handed to Triager.
 """
 import re
 

@@ -16,11 +16,7 @@ from ..services import timeline
 from ..services.audit import log_event
 
 _EPOCH = dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
-# Bounds a full CSV export the same way the interactive query is already
-# bounded (services/timeline.py's per-table cap) -- large enough to cover
-# a real "give me everything" export, not so large a pathological case
-# turns one request into an unbounded memory/time sink.
-_EXPORT_ROW_CAP = 50_000
+_EXPORT_ROW_CAP = 50_000  # bounds a full export the same way the interactive query is already bounded
 
 
 def _safe_timestamp(epoch):
@@ -70,6 +66,7 @@ def query_timeline(case_id: str, payload: TimelineQuery, db: Session = Depends(g
         end_epoch=end_epoch,
         page=payload.page,
         page_size=min(payload.page_size, 1000),
+        descending=payload.descending,
     )
 
     entries = []
@@ -108,6 +105,7 @@ def export_timeline_csv(
     query: str | None = None,
     start: dt.datetime | None = None,
     end: dt.datetime | None = None,
+    descending: bool = True,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -132,6 +130,7 @@ def export_timeline_csv(
         end_epoch=end_epoch,
         page=1,
         page_size=_EXPORT_ROW_CAP,
+        descending=descending,
     )
 
     log_event(

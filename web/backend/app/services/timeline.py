@@ -2,11 +2,10 @@
 column (see csv_importer._detect_and_populate_timeline_columns) into one
 chronological stream across every machine in a case.
 
-Cross-table pagination is a bounded k-way merge, not an exact sort over
-everything: each table contributes up to offset + page_size rows (already
-epoch-sorted at the SQL level), then the merge/slice happens in Python.
-Exact for normal paging depth; very deep pagination may skip entries from
-a table with more matches than its per-table cap allowed.
+Pagination is a bounded k-way merge: each table contributes up to
+offset + page_size rows (already epoch-sorted in SQL), then Python
+merges/slices. Exact for normal paging depth; very deep pagination may
+skip entries from a table with more matches than its per-table cap.
 """
 from typing import Any, Optional
 
@@ -71,6 +70,7 @@ def query_timeline(
     end_epoch: Optional[float] = None,
     page: int = 1,
     page_size: int = 200,
+    descending: bool = True,
 ) -> dict[str, Any]:
     conn = get_connection(case_id)
     try:
@@ -119,7 +119,7 @@ def query_timeline(
             approx_total += count_row["c"] if count_row else 0
 
             rows = conn.execute(
-                f'SELECT * FROM {table} {where_sql} ORDER BY "{epoch_col}" ASC LIMIT ?',
+                f'SELECT * FROM {table} {where_sql} ORDER BY "{epoch_col}" {"DESC" if descending else "ASC"} LIMIT ?',
                 params + [per_table_limit],
             ).fetchall()
 
@@ -136,7 +136,7 @@ def query_timeline(
                     "row": row_dict,
                 })
 
-        candidates.sort(key=lambda c: c["epoch"])
+        candidates.sort(key=lambda c: c["epoch"], reverse=descending)
         page_slice = candidates[offset: offset + page_size]
 
         return {

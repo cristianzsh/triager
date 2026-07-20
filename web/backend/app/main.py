@@ -38,14 +38,10 @@ def _warn_if_default_jwt_secret():
 
 
 def _bootstrap_admin():
-    """
-    Creates a first admin account on a fresh install so there's always a way
-    in. Credentials come from env vars; if unset, a random password is
-    generated, printed to the server log, and also written to a file next
-    to the app's data directory, a packaged --windowed desktop build has
-    no visible console, so stdout alone would make a generated password
-    unrecoverable on first run.
-    """
+    """Creates a first admin account on a fresh install. Credentials come
+    from env vars; if unset, a random password is generated, logged, and
+    written to a file next to the data dir (a --windowed build has no
+    visible console, so stdout alone would lose it)."""
     db = SessionLocal()
     try:
         if db.query(User).count() > 0:
@@ -107,16 +103,10 @@ def health():
 # investigator only needs one URL. In a hardened deployment, put this behind
 # a reverse proxy (nginx/Caddy) with TLS instead.
 class NoCacheStaticFiles(StaticFiles):
-    """
-    Plain StaticFiles is happy to let a browser cache app.js/styles.css/
-    index.html indefinitely with no revalidation, which means updating the
-    frontend on the server can silently keep serving a stale, previously
-    cached copy to anyone who doesn't hard-refresh, and a stale app.js
-    calling old/renamed API routes shows up as confusing 404s that look
-    like a backend bug. Force revalidation on every request instead: the
-    browser always asks the server "has this changed?" (a cheap 304 if not)
-    rather than assuming a cached copy is still good.
-    """
+    """Plain StaticFiles lets browsers cache app.js/styles.css/index.html
+    indefinitely with no revalidation -- a frontend update can silently
+    keep serving a stale copy that 404s against renamed API routes,
+    looking like a backend bug. Forces revalidation every request instead."""
     async def get_response(self, path: str, scope: Scope):
         response = await super().get_response(path, scope)
         response.headers["Cache-Control"] = "no-cache, must-revalidate"

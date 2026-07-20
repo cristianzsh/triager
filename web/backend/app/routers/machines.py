@@ -54,12 +54,10 @@ def get_machine(case_id: str, machine_id: str, db: Session = Depends(get_db), us
 def download_processed_data(case_id: str, machine_id: str, request: Request,
                              db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """
-    Downloads the machine's processed evidence (its triager_out/ directory)
-    as a ZIP, the CSV artifacts and Meta/ folder, for manual inspection
-    outside the console. Works the same way regardless of whether this
-    machine's data came from a raw-evidence Triager run or an
-    already-processed archive uploaded directly: both end up as a
-    triager_out/ directory, so there's nothing source_kind-specific here.
+    Downloads the machine's processed evidence (triager_out/, CSVs +
+    Meta/) as a ZIP for manual inspection. Works the same whether the
+    data came from a raw Triager run or an already-processed upload --
+    both end up as a triager_out/ directory.
     """
     require_case_access(case_id, user, db)
     machine = db.query(Machine).filter(Machine.id == machine_id, Machine.case_id == case_id).first()

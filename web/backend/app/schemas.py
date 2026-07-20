@@ -267,6 +267,7 @@ class TimelineQuery(BaseModel):
     end: Optional[dt.datetime] = None
     page: int = 1
     page_size: int = 200
+    descending: bool = True  # newest-first by default; old carried-over file timestamps shouldn't dominate the start
 
 
 class TimelineEntry(BaseModel):

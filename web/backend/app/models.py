@@ -83,13 +83,10 @@ class MachineStatus(str, enum.Enum):
 
 
 class Machine(Base):
-    """
-    One evidence/triage ZIP == one Machine (one host). Its artifact tables
-    live in the case's shared SQLite database (see case_db.py), each
-    prefixed by this machine's id, so correlation can span every machine in
-    a case with a single query while a single machine's artifacts stay
-    trivially scoped by table-name prefix.
-    """
+    """One evidence/triage ZIP == one Machine (one host). Its artifact
+    tables live in the case's shared SQLite database (case_db.py),
+    prefixed by this machine's id, so correlation spans every machine
+    with a single query while one machine stays trivially scoped."""
     __tablename__ = "machines"
 
     id = Column(String, primary_key=True, default=uid)
@@ -165,15 +162,10 @@ class Job(Base):
 
 
 class AIMessage(Base):
-    """
-    One turn of an AI conversation. conversation_key is an opaque string
-    the frontend derives per "page", e.g. broad:case for the whole-case
-    broad analysis view, broad:<machine_id> for that view scoped to one
-    machine, or table:<machine_id>:<table> for a specific artifact
-    table's quick-analysis panel, so each place "AI analysis" appears
-    keeps its own persisted, continuable conversation, exactly like
-    separate chat threads.
-    """
+    """One turn of an AI conversation. conversation_key is an opaque
+    per-page string (broad:case, broad:<machine_id>, table:<machine_id>:
+    <table>) so every place "AI analysis" appears keeps its own
+    persisted, continuable conversation, like separate chat threads."""
     __tablename__ = "ai_messages"
 
     id = Column(String, primary_key=True, default=uid)
@@ -185,18 +177,10 @@ class AIMessage(Base):
 
 
 class AuditEvent(Base):
-    """
-    Append-only record of who did what, when. Not tied to Job (which only
-    tracks the ingest pipeline), this covers logins, case/machine
-    lifecycle, membership changes, exports, IOC scans, and AI questions
-    asked, so a case's history can actually be reconstructed later rather
-    than just its current state.
-
-    case_id is nullable because some events aren't scoped to a case
-    (login, user creation/role changes). target_type/target_id name
-    whatever the action was performed on (a machine, a user, a table
-    export, ...) independent of the actor.
-    """
+    """Append-only record of who did what, when -- logins, case/machine
+    lifecycle, membership changes, exports, IOC scans, AI questions.
+    case_id is nullable for events not scoped to a case (login, user
+    creation). target_type/target_id name whatever was acted on."""
     __tablename__ = "audit_events"
 
     id = Column(String, primary_key=True, default=uid)
@@ -213,17 +197,11 @@ class AuditEvent(Base):
 
 
 class Finding(Base):
-    """
-    An investigator's own flagged conclusion about a specific artifact row, independent of AI, and the actual analytical work product of an
-    investigation (the AI conversation history captures what was asked/
-    answered; this captures what the human decided actually matters).
-
-    Row identity is a snapshot, not a live reference: row_snapshot stores
-    the full row as JSON at the moment it was flagged, so the finding still
-    means something even if that row is later edited or the artifact table
-    is dropped and re-imported (row_rowid becomes best-effort only in
-    that case, not authoritative).
-    """
+    """An investigator's own flagged conclusion about a specific artifact
+    row -- the human's analytical work product, independent of the AI
+    conversation history. row_snapshot stores the full row as JSON at
+    flag time, so it stays meaningful even if the row is later edited or
+    the table is re-imported (row_rowid becomes best-effort only then)."""
     __tablename__ = "findings"
 
     id = Column(String, primary_key=True, default=uid)

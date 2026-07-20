@@ -49,14 +49,12 @@ def extract_zip(
 ) -> Path:
     """
     Extracts zip_path under dest_root. Returns the effective root
-    (unwraps a single top-level directory, matching Triager's own behavior,
-    so config-relative paths like uploads\\auto\\C%3A\\... resolve the
-    same way whether run via web UI or CLI).
+    (unwraps a single top-level directory, matching Triager's own
+    behavior, so config-relative paths resolve the same via web or CLI).
 
-    If skip_large_files is set, any member whose recorded (uncompressed)
-    size exceeds max_file_size_bytes is never written to disk -- the size
-    is already known from the archive's own central directory, so this
-    costs nothing extra to check before deciding whether to extract.
+    If skip_large_files, any member over max_file_size_bytes is never
+    written to disk (size is already known from the archive's own
+    central directory, so this is free to check).
     """
     if not zipfile.is_zipfile(zip_path):
         raise ValueError(f"Not a valid zip file: {zip_path}")

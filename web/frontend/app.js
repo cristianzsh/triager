@@ -54,23 +54,16 @@ function aiRequestBase(cfg) {
   };
 }
 
-// Renders AI answers as interpreted Markdown. Sanitized with DOMPurify
-// before injection, the model's answer can quote/reflect strings pulled
-// straight from evidence data (filenames, registry values, etc.), which
-// may contain attacker-crafted HTML/script; treat it as untrusted input
-// even though the investigator triggered the request themselves.
+// Sanitized with DOMPurify since AI answers can quote strings pulled
+// straight from evidence data, which may contain attacker-crafted HTML.
 function renderMarkdown(md) {
   const raw = window.marked ? marked.parse(md || "") : escapeHtml(md || "").replace(/\n/g, "<br>");
   return window.DOMPurify ? DOMPurify.sanitize(raw) : raw;
 }
 
-// The modern Clipboard API (navigator.clipboard) only exists in a "secure
-// context", HTTPS, or http://localhost. A self-hosted tool like this one
-// is often reached over plain HTTP via a LAN IP (http://192.168.x.x:8000),
-// where navigator.clipboard is simply undefined and every copy silently
-// fails. document.execCommand('copy') is deprecated but still works in
-// insecure contexts in every major browser, so it's the fallback here
-// rather than the last resort.
+// navigator.clipboard needs a secure context (HTTPS/localhost) and is
+// undefined over plain HTTP (e.g. a LAN IP), where this self-hosted tool
+// is often reached -- execCommand('copy') still works there.
 function execCommandCopyText(text) {
   const ta = document.createElement("textarea");
   ta.value = text;
@@ -169,10 +162,8 @@ async function api(path, { method = "GET", body, headers = {}, raw = false } = {
   return ct.includes("application/json") ? resp.json() : resp.text();
 }
 
-// Authenticated file download, a plain <a href> can't carry the Bearer
-// token, so the browser makes an anonymous request and the API (correctly)
-// rejects it with 401. Fetch with the auth header instead, then hand the
-// browser a blob URL to download.
+// A plain <a href> can't carry the Bearer token -- fetch with the auth
+// header, then hand the browser a blob URL to download.
 async function downloadAuthenticated(url, filename) {
   const resp = await api(url, { raw: true });
   const blob = await resp.blob();
@@ -186,10 +177,8 @@ async function downloadAuthenticated(url, filename) {
   setTimeout(() => URL.revokeObjectURL(objectUrl), 4000);
 }
 
-// For data already fetched client-side (IOC scan results), building and
-// downloading the CSV directly avoids both a redundant backend round-trip
-// and the URL-length limits a long pasted IOC list could hit on a
-// GET-based export endpoint.
+// For data already fetched client-side (IOC scan results), building the
+// CSV directly avoids a round-trip and URL-length limits on a long IOC list.
 function downloadClientCsv(filename, headers, rows) {
   const escapeCell = (v) => {
     const s = v === null || v === undefined ? "" : String(v);
@@ -1136,14 +1125,10 @@ function showRowDetail(tableLabel, row, meta) {
   }
 }
 
-// Reusable AI conversation panel
-// Mounts a full AI conversation (persisted history + ask box) into host.
-// conversationKey scopes the history server-side (e.g. "broad:case",
-// "broad:<machine_id>", or "table:<machine_id>:<table>") so each place "AI
-// analysis" appears keeps its own independent, continuable thread.
-// askExtra supplies the fixed parts of every /ai/ask call for this panel
-// (machine_id / tables / search); templates, if given, renders DFIR
-// question-template buttons above the input box.
+// Mounts a full AI conversation (persisted history + ask box). conversationKey
+// scopes history server-side (e.g. "broad:case", "table:<machine_id>:<table>")
+// so each place "AI analysis" appears keeps its own thread. askExtra supplies
+// the fixed per-panel /ai/ask params; templates renders question-template buttons.
 async function mountAiConversation(host, { conversationKey, askExtra, templates, defaultQuestion }) {
   const cfg = loadAiConfig();
   host.innerHTML = `
@@ -1435,9 +1420,16 @@ async function renderTimelineView() {
     <div class="subtitle">Every detected timestamp column across every artifact table (and machine) merged into one chronological stream. Click an entry to see the full event.</div>
     <div class="toolbar">
       <div id="tl-search-box" class="query-box-wrap"></div>
+      <label style="font-size:12px;color:var(--text-dim);white-space:nowrap">Sort
+        <select id="tl-sort" style="width:auto">
+          <option value="desc">Newest first</option>
+          <option value="asc">Oldest first</option>
+        </select>
+      </label>
       <button class="primary" id="tl-run">Apply</button>
       <button id="tl-export">Download CSV</button>
     </div>
+    <div class="hint">Defaults to newest first -- a machine's filesystem is full of old, legitimate-but-irrelevant carried-over timestamps (e.g. an OS file's original build date) that would otherwise dominate the start of a strictly chronological view.</div>
     <div class="hint query-hint">${queryHintText(true)}</div>
     <div class="toolbar">
       <label style="font-size:12px;color:var(--text-dim)">From <input type="datetime-local" id="tl-start" /></label>
@@ -1479,6 +1471,7 @@ async function renderTimelineView() {
     if (queryVal) params.set("query", queryVal);
     if (startVal) params.set("start", new Date(startVal).toISOString());
     if (endVal) params.set("end", new Date(endVal).toISOString());
+    params.set("descending", document.getElementById("tl-sort").value === "desc" ? "true" : "false");
     const filtered = machineIds.length || categories.length || queryVal || startVal || endVal;
     const qs = params.toString();
     downloadAuthenticated(
@@ -1505,6 +1498,7 @@ async function renderTimelineView() {
         start: startVal ? new Date(startVal).toISOString() : null,
         end: endVal ? new Date(endVal).toISOString() : null,
         page, page_size: pageSize,
+        descending: document.getElementById("tl-sort").value === "desc",
       },
     });
 
@@ -1548,6 +1542,7 @@ async function renderTimelineView() {
   };
 
   document.getElementById("tl-run").addEventListener("click", () => run(1));
+  document.getElementById("tl-sort").addEventListener("change", () => run(1));
   run(1);
 }
 
@@ -1900,10 +1895,8 @@ function renderHostIdentityPanel() {
   `;
 }
 
-// Shows a "browse what's already imported" link while ingest is still in
-// progress, Triager's own parsers finish (and get incrementally
-// imported) well before the whole run exits, so there's often real,
-// browsable data available long before "ready".
+// "Browse what's already imported" link during ingest -- parsers finish
+// (and get incrementally imported) well before the whole run exits.
 function renderPartialArtifactsPanel() {
   const panel = document.getElementById("partial-artifacts-panel");
   if (!panel) return;
@@ -2058,11 +2051,8 @@ async function showJobLog(jobId) {
   if (jobsList) await renderJobLogPanel(jobId, jobsList);
 }
 
-// Fetches and (re-)renders one job's log <pre> block, replacing any
-// previous instance of it. Used both by the initial "log" button click and
-// by refreshJobs()'s poll tick, so a log left open during a long-running
-// ingest stays open AND keeps showing live content instead of freezing or
-// disappearing on the next refresh.
+// Fetches and (re-)renders one job's log <pre>. Used by both the initial
+// button click and refreshJobs()'s poll tick, so an open log stays live.
 async function renderJobLogPanel(jobId, jobsList) {
   const log = await api(`/jobs/${jobId}/log`);
   const existing = document.getElementById(`log-${jobId}`);

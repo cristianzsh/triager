@@ -1,17 +1,16 @@
 """
-Path resolution that works identically whether this app is run from source
-(uvicorn app.main:app) or frozen into a single executable with PyInstaller. bundle_dir(): where read-only packaged resources live (the frontend's
-    index.html/app.js/styles.css). PyInstaller --onefile extracts these into
-    a temp directory (sys._MEIPASS) fresh on every launch, fine for files
-    you only ever read. writable_data_dir(): where the app's persistent data lives (case
-    databases, uploads, the app's own users/cases/jobs database). This must
-    NOT be sys._MEIPASS, that directory is wiped and recreated every time
-    a --onefile exe runs, so anything written there disappears when the app
-    closes. Instead this resolves to %APPDATA%\\triager\\data (or the source
-    tree, when not frozen) -- the same per-user location Triager's own
-    tools/ gets extracted to on first run, so an investigator's cases
-    persist across restarts, survive the exe being moved or rebuilt, and
-    are easy to find/back up.
+Path resolution that works identically whether this app runs from source
+(uvicorn app.main:app) or frozen into a single PyInstaller executable.
+
+bundle_dir(): read-only packaged resources (frontend's index.html/app.js/
+styles.css). PyInstaller --onefile extracts these fresh to sys._MEIPASS
+on every launch -- fine for files only ever read.
+
+writable_data_dir(): persistent data (case databases, uploads, the app's
+own db). Must NOT be sys._MEIPASS, which is wiped on every launch.
+Resolves to %APPDATA%\\triager\\data instead (or the source tree when not
+frozen) -- the same per-user location tools/ extracts to, so cases persist
+across restarts and are easy to find/back up.
 """
 import os
 import sys
@@ -52,12 +51,10 @@ def writable_data_dir() -> Path:
 
 def tools_dir() -> Path:
     """
-    Where Triager.exe's own forensic utilities live. Only used as a
-    fallback path for a standalone web-only deployment (no merged
-    Triager binary, no sibling triager.py checkout) -- see
-    triager_runner.resolve_triager_command(). A normal merged-binary
-    deployment extracts tools/ to appdata_root() / "tools" itself (see
-    triager.py's _ensure_tools_dir()) and never touches this function.
+    Where Triager.exe's own forensic utilities live. Only a fallback for a
+    standalone web-only deployment (see triager_runner.resolve_triager_command);
+    a normal merged binary extracts tools/ itself via triager.py's
+    _ensure_tools_dir() and never touches this.
     """
     if is_frozen():
         return bundle_dir() / "tools"

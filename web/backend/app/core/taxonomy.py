@@ -1,17 +1,12 @@
 """
-Mirrors Triager's OUTPUT_SUBDIRS / directory layout so the web UI's lateral
-menu groups artifacts exactly the way investigators already expect from the
-CLI tool's output folder.
+Mirrors Triager's OUTPUT_SUBDIRS layout so the web UI's sidebar groups
+artifacts the way the CLI tool's output folder already does.
 
-Triager's own top-level folders (from its README):
-  Event logs, Evidence of execution, File system artifacts, Meta,
-  Persistence, Registry, User artifacts
+Triager's top-level folders: Event logs, Evidence of execution, File
+system artifacts, Meta, Persistence, Registry, User artifacts.
 
-Each category maps to one or more sub-folders that contain the CSV outputs
-of specific parser tools. The importer walks the Triager output directory,
-and for every CSV file found under one of these folders, creates a SQLite
-table named "<subfolder>__<csv_stem>" (sanitized), and records it against
-the category below so the UI can build its sidebar.
+Each category maps to sub-folders of CSV output. The importer creates a
+table "<subfolder>__<csv_stem>" per CSV and records its category here.
 """
 
 CATEGORIES: dict[str, dict] = {

@@ -84,15 +84,9 @@ def _is_empty_value(v) -> bool:
 
 
 def _prune_empty_columns(rows: list[dict]) -> list[dict]:
-    """Drops columns that are entirely empty/null (or filled with common
-    placeholder sentinels like a blank .NET DateTime) across every row in
-    this page. Purely data-driven -- no per-artifact-type knowledge
-    needed, and strictly safe: a column with zero populated values across
-    the whole sample carries zero information for the AI to lose.
-    Forensic CSV exports routinely have 20-40 columns where only a
-    handful are ever populated for a given artifact, so this alone often
-    cuts payload size substantially without touching anything that's
-    actually informative."""
+    """Drops columns entirely empty/null (or all placeholder sentinels)
+    across every row -- safe since an all-empty column carries nothing
+    to lose, and forensic CSVs routinely have 20-40 mostly-unused columns."""
     if not rows:
         return rows
     keys = rows[0].keys()
@@ -103,11 +97,8 @@ def _prune_empty_columns(rows: list[dict]) -> list[dict]:
 
 
 def _truncate_long_values(rows: list[dict]) -> list[dict]:
-    """Truncates individual cell values that are unusually long (raw binary
-    blobs rendered as hex/base64, huge paths) rather than letting one
-    field crowd out the rest of its row -- and every other row's share of
-    the table's budget -- for a value that's rarely the forensically
-    relevant part anyway."""
+    """Truncates unusually long cell values (raw blobs, huge paths) so one
+    field doesn't crowd out the rest of the table's budget."""
     out = []
     for r in rows:
         new_row = {}
@@ -147,12 +138,9 @@ def delete_history(case_id: str, conversation_key: str, db: Session = Depends(ge
 
 
 def _fit_rows_to_budget(rows: list[dict], budget: int) -> tuple[list[dict], bool]:
-    """Returns as many whole rows as fit within budget characters of
-    serialized JSON, never a partial row. Slicing the serialized JSON
-    string directly at a character boundary (the previous approach) can
-    cut off mid-object and hand the model syntactically invalid JSON with
-    no indication anything's wrong -- this guarantees what's included is
-    always a complete, parseable array."""
+    """Returns as many whole rows as fit within budget chars of JSON, never
+    a partial row (slicing the string directly can cut mid-object and
+    produce invalid JSON)."""
     if not rows:
         return rows, False
     full_len = len(json.dumps(rows, ensure_ascii=False))
@@ -210,11 +198,7 @@ def _build_context(case_id: str, payload: AIAnalysisRequest, db: Session) -> tup
         rows = _truncate_long_values(_prune_empty_columns(page["rows"]))
         fitted_rows, row_level_truncated = _fit_rows_to_budget(rows, _budget_for(table))
         if not fitted_rows:
-            # Even a single row doesn't fit this table's share of the
-            # budget (extremely wide rows, e.g. many long path columns) --
-            # skip rather than send something empty for a table label
-            # that promised data.
-            truncated = True
+            truncated = True  # doesn't even fit one row (e.g. very wide rows) -- skip the table
             continue
         if row_level_truncated:
             truncated = True
@@ -226,11 +210,9 @@ def _build_context(case_id: str, payload: AIAnalysisRequest, db: Session) -> tup
             f"### Machine: {machine_label} | Table: {label} ({table}){filter_note}{shown_note}\n{snippet}"
         )
 
-    # Safety net: even with the fair per-table split above, header text
-    # overhead across many tables could in principle still add up to
-    # slightly over budget. Trim whole table sections from the end rather
-    # than slicing mid-section like the per-table truncation used to --
-    # every section that makes it into the final blob is always complete.
+    # Safety net: header overhead across many tables could still push
+    # slightly over budget. Trim whole sections from the end (never
+    # mid-section) so everything included stays complete.
     included_parts = []
     included_tables = []
     total = 0
@@ -249,19 +231,13 @@ def _build_context(case_id: str, payload: AIAnalysisRequest, db: Session) -> tup
 
 @router.post("/ask", response_model=AIAnalysisResponse)
 def ask_ai(case_id: str, payload: AIAnalysisRequest, request: Request, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    """
-    Builds a context snapshot from the requested (or all) artifact tables and
-    sends it, alongside the investigator's question and recent prior turns
-    of this same conversation, to the LLM endpoint they specify, local
-    (Ollama/vLLM/LM Studio, OpenAI-compatible) or Claude directly. Nothing
-    is sent anywhere unless the investigator explicitly triggers this.
+    """Builds a context snapshot from the requested (or all) artifact
+    tables and sends it, with the question and recent conversation
+    history, to the specified LLM (local/OpenAI-compatible or Claude).
+    Nothing is sent unless the investigator explicitly triggers this.
 
-    Every call is scoped to a conversation_key (opaque, frontend-derived
-    per page), the question and answer are persisted under that key so
-    reopening the same page later shows the same conversation, and multiple
-    pages (broad case analysis, one machine's analysis, each table's quick
-    analysis) never mix history together.
-    """
+    Scoped by conversation_key (per page) so history persists per scope
+    without mixing between broad/machine/table-level conversations."""
     require_case_access(case_id, user, db, need_edit=True)
 
     if payload.provider == "claude":
@@ -349,11 +325,9 @@ def _post_with_retry(url: str, **kwargs) -> requests.Response:
 
 
 def _raise_for_status_with_body(resp: requests.Response, provider_name: str) -> None:
-    """requests' own raise_for_status() only gives you the URL and status
-    code, it throws away the response body, which is exactly where the
-    provider explains why the request was rejected (bad model name,
-    context too long, malformed message, etc). Surface that instead so the
-    investigator sees the actual reason, not just '400 Client Error'."""
+    """raise_for_status() discards the response body, which is where the
+    provider explains why the request was rejected. Surface that instead
+    of a bare '400 Client Error'."""
     if resp.ok:
         return
     try:

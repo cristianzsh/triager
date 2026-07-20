@@ -233,11 +233,9 @@ def field_catalog(
 
 
 def _value_matches_case_sensitive(op: str, cell_value, needle: str) -> bool:
-    """SQLite's LIKE is case-insensitive by default, so a case_sensitive=True
-    request still needs this Python-level re-check against the actual cell
-    value for the ops that compile to LIKE/NOT LIKE. = and != already do a
-    byte-wise (case-sensitive) comparison at the SQL level, so they don't
-    need this."""
+    """SQLite's LIKE is case-insensitive by default; re-checks the actual
+    cell value in Python for ops that compile to LIKE/NOT LIKE. = and !=
+    are already byte-wise at the SQL level, so they don't need this."""
     cell = "" if cell_value is None else str(cell_value)
     if op == "contains":
         return needle in cell
@@ -301,10 +299,7 @@ def correlate_query(
                         continue
                     op_value = cond.value
                     if cond.op == "regex" and not case_sensitive:
-                        # REGEXP's registered function (_regexp below) is
-                        # always case-sensitive regardless of this flag --
-                        # an inline (?i) makes it respect case_sensitive=False.
-                        op_value = f"(?i){cond.value}"
+                        op_value = f"(?i){cond.value}"  # REGEXP is always case-sensitive otherwise
                     frag, params = query_lang.condition_sql(cond.op, real_col, op_value)
                 else:
                     or_parts = [f'"{c}" LIKE ?' for c in columns]
