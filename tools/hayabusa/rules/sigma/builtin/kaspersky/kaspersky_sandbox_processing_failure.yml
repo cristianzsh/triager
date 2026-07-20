@@ -1,0 +1,36 @@
+title: Kaspersky Sandbox File Processing Failure
+id: e61f1ff0-9718-4b47-8b97-731dc75d420e
+status: experimental
+description: |
+  Detects when Kaspersky Endpoint Security fails to analyze a file in the sandbox.
+  Based on Event ID 2617. Matches presence of file hashes to confirm object-level scanning context.
+
+author: Cristian Souza
+date: 2025-07-24
+modified: 2025-07-24
+level: high
+logsource:
+  product: windows
+  service: 'Kaspersky Endpoint Security'
+detection:
+  selection:
+    Provider_Name: 'avp'
+    EventID: 2617
+    Channel: 'Kaspersky Endpoint Security'
+  hash_presence:
+    Data|contains:
+      - 'MD5:'
+      - 'SHA256:'
+  condition: selection and hash_presence
+falsepositives:
+  - Sandbox timeout or overload
+tags:
+  - kaspersky
+  - evtx
+  - sandbox
+  - failure
+  - file_analysis
+  - hash
+  - endpoint_security
+ruletype: Sigma
+engine: k-evtrace

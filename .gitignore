@@ -1,7 +1,5 @@
 build/
 bin/
-tools/*
-!tools/.gitkeep
 __pycache__/
 *.pyc
 .env

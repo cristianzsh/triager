@@ -1,0 +1,32 @@
+title: Kaspersky Process Failure in Previous Session
+id: e6efc4a9-296b-4e28-9247-d59e062b8263
+status: experimental
+description: |
+  Detects when the Kaspersky core process (avp.exe) reports a failure in the previous session.
+  Based solely on Event ID 237 from the 'avp' provider.
+  Useful for identifying instability or potential tampering of security processes.
+
+author: Cristian Souza
+date: 2025-07-24
+modified: 2025-07-24
+level: medium
+logsource:
+  product: windows
+  service: 'Kaspersky Endpoint Security'
+detection:
+  selection:
+    Provider_Name: 'avp'
+    EventID: 237
+    Channel: 'Kaspersky Endpoint Security'
+  condition: selection
+falsepositives:
+  - Legitimate OS shutdown or crash recovery
+  - Scheduled system reboots
+tags:
+  - kaspersky
+  - evtx
+  - crash
+  - antivirus
+  - endpoint_security
+ruletype: Sigma
+engine: k-evtrace

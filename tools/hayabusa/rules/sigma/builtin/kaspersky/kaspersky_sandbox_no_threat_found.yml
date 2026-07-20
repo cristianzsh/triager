@@ -1,0 +1,34 @@
+title: Kaspersky Sandbox Scan Completed – No Threat Found
+id: 14c3dd27-d9d0-46b7-8a46-3bdfd80c0b01
+status: experimental
+description: |
+  Detects sandbox verdicts where no threat was found after asynchronous file analysis.
+  Based on Event ID 2616 from Kaspersky Endpoint Security, confirmed by presence of file hashes.
+
+author: Cristian Souza
+date: 2025-07-24
+modified: 2025-07-24
+level: informational
+logsource:
+  product: windows
+  service: 'Kaspersky Endpoint Security'
+detection:
+  selection:
+    Provider_Name: 'avp'
+    EventID: 2616
+    Channel: 'Kaspersky Endpoint Security'
+  hash_presence:
+    Data|contains:
+      - 'MD5:'
+      - 'SHA256:'
+  condition: selection and hash_presence
+tags:
+  - kaspersky
+  - evtx
+  - sandbox
+  - verdict
+  - file_analysis
+  - hash
+  - endpoint_security
+ruletype: Sigma
+engine: k-evtrace

@@ -1,0 +1,39 @@
+title: Kaspersky Detection Event
+id: d2a938b0-2519-4b74-b4be-32e70aef804c
+status: experimental
+description: |
+  Detects malware detections from Kaspersky antivirus (Event ID 302).
+  This rule matches on presence of file hash patterns (MD5, SHA256) in the EventData.
+
+author: Cristian Souza
+date: 2025-07-23
+modified: 2025-07-23
+level: critical
+logsource:
+  product: windows
+  service: 'Kaspersky Endpoint Security'
+detection:
+  selection:
+    Provider_Name: 'avp'
+    EventID:
+      - 302
+      - 231
+    Channel: 'Kaspersky Endpoint Security'
+
+  hash_match:
+    Data|contains:
+      - 'MD5:'
+      - 'SHA256:'
+
+  condition: selection and hash_match
+falsepositives:
+  - EICAR test files
+tags:
+  - attack.defense_evasion
+  - kaspersky
+  - evtx
+  - detection
+  - antivirus
+  - hash
+ruletype: Sigma
+engine: k-evtrace

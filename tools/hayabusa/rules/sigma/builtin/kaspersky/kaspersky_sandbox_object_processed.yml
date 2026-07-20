@@ -1,0 +1,34 @@
+title: Kaspersky Sandbox Object Processed
+id: 3e7b9f51-48b3-4d1f-8d29-e29dd39a45fc
+status: experimental
+description: |
+  Detects successful processing of files by the Kaspersky sandbox.
+  Based on Event ID 2608 and confirmed by the presence of file hashes.
+
+author: Cristian Souza
+date: 2025-07-24
+modified: 2025-07-24
+level: informational
+logsource:
+  product: windows
+  service: 'Kaspersky Endpoint Security'
+detection:
+  selection:
+    Provider_Name: 'avp'
+    EventID: 2608
+    Channel: 'Kaspersky Endpoint Security'
+  hash_presence:
+    Data|contains:
+      - 'MD5:'
+      - 'SHA256:'
+  condition: selection and hash_presence
+tags:
+  - kaspersky
+  - evtx
+  - sandbox
+  - file_analysis
+  - hash
+  - endpoint_security
+  - scan_complete
+ruletype: Sigma
+engine: k-evtrace

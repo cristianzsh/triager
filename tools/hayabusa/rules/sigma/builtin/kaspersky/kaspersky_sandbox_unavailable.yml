@@ -1,0 +1,37 @@
+title: Kaspersky Sandbox Node Unavailable
+id: 40d9a31f-03e2-4b47-a682-f65c8b53e1d5
+status: experimental
+description: |
+  Detects unavailability of sandbox infrastructure in Kaspersky environments.
+  Matches Event ID 2614 and includes generic indicator for HTTP/S URI references in the event data.
+
+author: Cristian Souza
+date: 2025-07-24
+modified: 2025-07-24
+level: high
+logsource:
+  product: windows
+  service: 'Kaspersky Endpoint Security'
+detection:
+  selection:
+    Provider_Name: 'avp'
+    EventID: 2614
+    Channel: 'Kaspersky Endpoint Security'
+  uri_indicator:
+    Data|contains:
+      - 'http://'
+      - 'https://'
+  condition: selection and uri_indicator
+falsepositives:
+  - Sandbox maintenance
+  - Network configuration errors
+  - DNS or TLS failures
+tags:
+  - kaspersky
+  - evtx
+  - sandbox
+  - network
+  - http
+  - endpoint_security
+ruletype: Sigma
+engine: k-evtrace

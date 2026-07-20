@@ -1,0 +1,31 @@
+title: Kaspersky File Processing Error
+id: 5ac4a7a1-2835-4d1e-95b2-e7548e4ce062
+status: experimental
+description: |
+  Detects when Kaspersky encounters a file processing error (e.g., access or scan failure).
+
+author: Cristian Souza
+date: 2025-07-24
+modified: 2025-07-24
+level: medium
+logsource:
+  product: windows
+  service: 'Kaspersky Endpoint Security'
+detection:
+  selection:
+    Provider_Name: 'avp'
+    EventID: 317
+    Channel: 'Kaspersky Endpoint Security'
+  condition: selection
+falsepositives:
+  - Temporary access issues (e.g., locked files, cloud sync)
+  - Corrupted or transient file system states
+tags:
+  - kaspersky
+  - evtx
+  - error
+  - processing
+  - antivirus
+  - endpoint_security
+ruletype: Sigma
+engine: k-evtrace

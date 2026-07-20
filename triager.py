@@ -3088,7 +3088,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--skip-large-files",
         action="store_true",
-        help="Don't extract files from --zip larger than --max-file-size-mb (saves disk space).",
+        help="Don't extract files from --zip larger than --max-file-size-mb.",
     )
     ap.add_argument(
         "--max-file-size-mb",

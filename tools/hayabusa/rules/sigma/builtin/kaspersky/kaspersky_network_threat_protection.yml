@@ -1,0 +1,31 @@
+title: Kaspersky Network Threat Protection – Exploit Attempt Logged
+id: 83f4b6a0-489b-4f27-bbb7-1e1c2fdc5e12
+status: experimental
+description: |
+  Detects when Kaspersky Network Threat Protection logs an exploit attempt or related network event.
+  Event ID 3211.
+
+author: Cristian Souza
+date: 2025-07-25
+modified: 2025-07-25
+level: high
+logsource:
+  product: windows
+  service: 'Kaspersky Security'
+detection:
+  selection:
+    EventID: 3211
+    Provider_Name: 'Network Threat Protection'
+    Channel: 'Kaspersky Security'
+  condition: selection
+falsepositives:
+  - Simulated penetration tests
+tags:
+  - kaspersky
+  - evtx
+  - network
+  - intrusion
+  - endpoint_security
+  - detection
+ruletype: Sigma
+engine: k-evtrace
