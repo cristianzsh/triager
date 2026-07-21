@@ -21,6 +21,13 @@ NAME_HINTS = (
 NAME_EXCLUDE = (
     "timezone", "runcount", "runasuser", "username", "filename",
     "sourcefile", "runlevel", "enabled",
+
+    "created0x10", "created0x30", "lastaccess0x10", "lastaccess0x30",
+    "lastrecordchange0x10", "lastrecordchange0x30",
+
+    "sourcecreated", "sourceaccessed",
+
+    "linkdate", "drivertimestamp", "exetimestamp",
 )
 
 
@@ -42,7 +49,8 @@ _EXPLICIT_FORMATS = (
 
 _FILETIME_RE = re.compile(r"^\d{17,19}$")  # raw Windows FILETIME
 _BARE_NUMBER_RE = re.compile(r"^-?\d{1,7}$")  # e.g. an enum/ID/count, not a date
-_MIN_YEAR, _MAX_YEAR = 1990, 2100  # sanity range; outside this, the heuristic misfired
+_MIN_YEAR = 1990
+_MAX_YEAR = datetime.now(timezone.utc).year + 5
 
 
 def try_parse_datetime(value: str) -> Optional[datetime]:

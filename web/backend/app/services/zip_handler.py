@@ -7,6 +7,7 @@ extracts in a background thread since evidence archives can be tens of GB.
 import hashlib
 import os
 import shutil
+import time
 import zipfile
 from pathlib import Path
 from typing import Callable, Optional
@@ -37,6 +38,16 @@ def _truncate_path(p: Path, max_name: int = 120) -> Path:
     h = hashlib.sha1(name.encode("utf-8", errors="ignore")).hexdigest()[:10]
     keep = max(1, max_name - len(ext) - 11)
     return p.with_name(f"{stem[:keep]}_{h}{ext}")
+
+
+def _apply_zip_mtime(path: Path, zi: zipfile.ZipInfo) -> None:
+    """Better than every extracted file silently looking like
+    it was touched right now."""
+    try:
+        ts = time.mktime(zi.date_time + (0, 0, -1))
+        os.utime(path, (ts, ts))
+    except (ValueError, OverflowError, OSError):
+        pass  # some entries carry an all-zero/invalid date; leave extraction time as-is
 
 
 def extract_zip(
@@ -88,6 +99,7 @@ def extract_zip(
                 out_path.parent.mkdir(parents=True, exist_ok=True)
                 with zf.open(zi, "r") as src, out_path.open("wb") as dst:
                     shutil.copyfileobj(src, dst, length=1024 * 1024)
+                _apply_zip_mtime(out_path, zi)
             except Exception:
                 warned += 1
                 continue

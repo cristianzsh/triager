@@ -2983,6 +2983,12 @@ def _extract_zip_to_temp(
                 with zf.open(zi, "r") as src, out_path.open("wb") as dst:
                     shutil.copyfileobj(src, dst, length=1024 * 1024)
 
+                try:
+                    ts = time.mktime(zi.date_time + (0, 0, -1))
+                    os.utime(out_path, (ts, ts))
+                except (ValueError, OverflowError, OSError):
+                    pass
+
             except Exception as ex:
                 warned += 1
                 log_warn(f"ZIP extract warning: skipped '{zi.filename}': {ex}")
