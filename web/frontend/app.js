@@ -625,7 +625,7 @@ function renderCaseSidebar() {
 }
 
 function highlightActive() {
-  document.querySelectorAll(".sidebar .cat[data-machine]").forEach((n) => n.classList.toggle("active", state.currentMachine && n.dataset.machine === state.currentMachine.id && !state.currentCategory));
+  document.querySelectorAll(".sidebar .cat[data-machine]").forEach((n) => n.classList.toggle("active", state.currentMachine && n.dataset.machine === state.currentMachine.id));
   document.querySelectorAll(".sidebar .cat[data-cat]").forEach((n) => n.classList.toggle("active", n.dataset.cat === state.currentCategory));
   document.querySelectorAll(".sidebar .special").forEach((n) => n.classList.remove("active"));
 }
