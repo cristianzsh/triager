@@ -186,7 +186,6 @@ USE_COLOR = _supports_color()
 UPDATE_REPO = "cristianzsh/triager"
 UPDATE_ASSET_NAME = "triager.exe"
 
-
 def _parse_version(v: str) -> tuple:
     """Numeric parse ("v1.2.3-beta" -> (1, 2, 3))."""
     v = (v or "").strip().lstrip("vV")
@@ -302,7 +301,7 @@ def _spawn_self_replace_and_exit(current_exe: Path, new_exe: Path) -> None:
             ["cmd.exe", "/c", str(script_path)],
             creationflags=base_flags, close_fds=True, cwd=str(current_exe.parent),
         )
-    log_success(f"Update downloaded. Triager will restart in a moment (v{VERSION} -> new version).")
+    log_success(f"Update downloaded. Triager will restart in a moment.")
     sys.exit(0)
 
 

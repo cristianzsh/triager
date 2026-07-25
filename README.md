@@ -40,6 +40,7 @@ Triager Web Console builds on the same parsing engine and adds:
 - Word report generation
 - Partial artifact access while processing is still running
 - Downloadable processed evidence packages
+- Export and import cases across different analyst instances
 
 <img src="images/web_machine.png"/>
 <img src="images/web_ai_summary.png"/>
