@@ -183,6 +183,10 @@ automatically if it is not already on `PATH` (by downloading the
 official installer from python.org), builds one `Triager.exe`,
 copies it into `bin/` at the repository root, and starts the Web Console from there.
 
+## Updating Triager
+
+Run `Triager` with the `--update` option to get the latest release available.
+
 ## License
 
-Triager is released under the MIT License. See [LICENSE](LICENSE).
+`Triager` is released under the MIT License. See [LICENSE](LICENSE).

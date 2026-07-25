@@ -3292,9 +3292,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--update",
         action="store_true",
-        help="Check GitHub for a newer release. When running as the packaged exe, asks for "
-             "confirmation and then downloads and applies it; from source, just reports what's "
-             "available.",
+        help="Check GitHub for a newer release.",
     )
     ap.add_argument(
         "--web",
