@@ -183,6 +183,181 @@ def _ensure_tools_dir() -> Path:
 VERSION = "0.0.2"
 USE_COLOR = _supports_color()
 
+UPDATE_REPO = "cristianzsh/triager"
+UPDATE_ASSET_NAME = "triager.exe"
+
+
+def _parse_version(v: str) -> tuple:
+    """Numeric parse ("v1.2.3-beta" -> (1, 2, 3))."""
+    v = (v or "").strip().lstrip("vV")
+    nums = []
+    for part in re.split(r"[.\-+]", v):
+        m = re.match(r"^\d+", part)
+        if not m:
+            break
+        nums.append(int(m.group()))
+    return tuple(nums) if nums else (0,)
+
+
+def _urlopen_resilient(req, timeout: int):
+    """Tries certifi's CA bundle first, then falls back to the platform
+    default. Only re-tries on a cert verification error."""
+    import ssl
+    import urllib.error
+    import urllib.request
+
+    contexts = []
+    try:
+        import certifi
+        contexts.append(ssl.create_default_context(cafile=certifi.where()))
+    except Exception:
+        pass
+    contexts.append(ssl.create_default_context())
+
+    last_err = None
+    for ctx in contexts:
+        try:
+            return urllib.request.urlopen(req, timeout=timeout, context=ctx)
+        except urllib.error.URLError as ex:
+            if isinstance(ex.reason, ssl.SSLError):
+                last_err = ex
+                continue
+            raise
+    raise last_err
+
+
+def _latest_release_tag(repo: str, timeout: int = 15) -> str:
+    """Resolves the "latest" release tag."""
+    import urllib.request
+
+    url = f"https://github.com/{repo}/releases/latest"
+    req = urllib.request.Request(url, headers={"User-Agent": "Triager-Updater"})
+    with _urlopen_resilient(req, timeout) as resp:
+        final_url = resp.geturl()
+    tag = final_url.rstrip("/").rsplit("/", 1)[-1]
+    if not tag or tag == "latest":
+        raise RuntimeError("Could not determine the latest release version")
+    return tag
+
+
+def _download_with_progress(url: str, dest: Path, timeout: int = 30) -> None:
+    import urllib.request
+
+    req = urllib.request.Request(url, headers={"User-Agent": "Triager-Updater"})
+    with _urlopen_resilient(req, timeout) as resp:
+        total = int(resp.headers.get("Content-Length") or 0)
+        written = 0
+        last_pct = -1
+        with dest.open("wb") as f:
+            while True:
+                chunk = resp.read(1024 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+                written += len(chunk)
+                if total:
+                    pct = int(written * 100 / total)
+                    if pct != last_pct:
+                        with PRINT_LOCK:
+                            print(_c(C.STEP, f"\r[+] Downloading update... {pct}%"), end="", flush=True)
+                        last_pct = pct
+        if total:
+            with PRINT_LOCK:
+                print()
+    if dest.stat().st_size < 1024 * 1024:
+        raise RuntimeError("Downloaded file looks incomplete (too small)")
+
+
+def _spawn_self_replace_and_exit(current_exe: Path, new_exe: Path) -> None:
+    """Writes a helper script that waits for this process to exit, swaps
+    the new build into place, relaunches it, then deletes itself."""
+    script_fd, script_path_str = tempfile.mkstemp(suffix=".bat")
+    os.close(script_fd)
+    script_path = Path(script_path_str)
+    script_path.write_text(
+        "@echo off\r\n"
+        f'set "PID={os.getpid()}"\r\n'
+        f'set "NEWEXE={new_exe}"\r\n'
+        f'set "OLDEXE={current_exe}"\r\n'
+        # Wait-Process is the purpose-built way to wait on a PID; it
+        # throws if the process is already gone, which just means
+        # there's nothing to wait for.
+        'powershell -NoProfile -WindowStyle Hidden -Command '
+        '"try { Wait-Process -Id %PID% -Timeout 60 -ErrorAction Stop } catch { }"\r\n'
+        'move /Y "%NEWEXE%" "%OLDEXE%" >NUL\r\n'
+        'if not errorlevel 1 start "" "%OLDEXE%"\r\n'
+        'del "%~f0"\r\n',
+        encoding="utf-8",
+    )
+
+    base_flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    breakaway_flags = base_flags | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
+    try:
+        subprocess.Popen(
+            ["cmd.exe", "/c", str(script_path)],
+            creationflags=breakaway_flags, close_fds=True, cwd=str(current_exe.parent),
+        )
+    except OSError:
+        subprocess.Popen(
+            ["cmd.exe", "/c", str(script_path)],
+            creationflags=base_flags, close_fds=True, cwd=str(current_exe.parent),
+        )
+    log_success(f"Update downloaded. Triager will restart in a moment (v{VERSION} -> new version).")
+    sys.exit(0)
+
+
+def run_update() -> int:
+    """--update: compares this build's VERSION against the latest GitHub
+    release. Running from source only reports what's available, since
+    there's no single binary here to swap out."""
+    log_step(f"Current version: {VERSION}")
+    try:
+        latest_tag = _latest_release_tag(UPDATE_REPO)
+    except Exception as ex:
+        log_error(f"Could not check for updates: {ex}")
+        return 1
+
+    current_v, latest_v = _parse_version(VERSION), _parse_version(latest_tag)
+    if latest_v <= current_v:
+        log_success(f"You're already running the latest version (v{VERSION}).")
+        return 0
+
+    log_info(f"A newer version is available: {latest_tag}")
+    download_url = f"https://github.com/{UPDATE_REPO}/releases/download/{latest_tag}/{UPDATE_ASSET_NAME}"
+
+    if not getattr(sys, "frozen", False):
+        log_info("Running from source -- there's no single executable to replace here.")
+        log_info(f"Download the new build manually from: {download_url}")
+        return 0
+
+    try:
+        answer = input(f"Download and install v{latest_tag} now? [y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        answer = "n"
+    if answer not in ("y", "yes"):
+        log_info("Update cancelled.")
+        return 0
+
+    current_exe = Path(sys.executable).resolve()
+    new_exe = current_exe.parent / f"triager_update_{latest_tag}.exe"
+    try:
+        _download_with_progress(download_url, new_exe)
+    except Exception as ex:
+        log_error(f"Update download failed: {ex}")
+        log_info(f"You can download it manually from: {download_url}")
+        new_exe.unlink(missing_ok=True)
+        return 1
+
+    try:
+        _spawn_self_replace_and_exit(current_exe, new_exe)
+    except Exception as ex:
+        log_error(f"Downloaded the update but couldn't apply it automatically: {ex}")
+        log_info(f"The new build is saved at: {new_exe}")
+        log_info(f"Replace {current_exe} with it manually.")
+        return 1
+    return 0
+
 # Config file (contains paths for the forensic evidence files).
 # You should adjust the contents of this file according to your needs.
 DEFAULT_CONFIG_NAME = "config.yml"
@@ -3115,6 +3290,13 @@ def parse_args() -> argparse.Namespace:
         help="Print every available parser name (for use with --exclude-parser) and exit.",
     )
     ap.add_argument(
+        "--update",
+        action="store_true",
+        help="Check GitHub for a newer release. When running as the packaged exe, asks for "
+             "confirmation and then downloads and applies it; from source, just reports what's "
+             "available.",
+    )
+    ap.add_argument(
         "--web",
         action="store_true",
         help="Start the Triager Console web server instead of processing evidence from the command line.",
@@ -3137,6 +3319,9 @@ def parse_args() -> argparse.Namespace:
         return args
 
     if args.list_parsers:
+        return args
+
+    if args.update:
         return args
 
     # Validate mode combinations
@@ -3331,6 +3516,9 @@ def main() -> int:
 
     if args.web:
         return _run_web_mode(args)
+
+    if args.update:
+        return run_update()
 
     if not TOOLS_DIR.exists():
         log_error(f"Tools directory not found: {TOOLS_DIR}")
