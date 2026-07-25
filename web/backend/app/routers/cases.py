@@ -1,14 +1,18 @@
 import shutil
+import tempfile
+from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from ..config import settings
 from ..database import get_db
 from ..models import Case, CaseMember, Machine, Job, AIMessage, Finding, User, Role
-from ..schemas import CaseCreate, CaseOut, CaseMemberAdd, CaseMemberOut, CaseStatusUpdate
+from ..schemas import CaseCreate, CaseOut, CaseExportRequest, CaseMemberAdd, CaseMemberOut, CaseStatusUpdate
 from ..security import get_current_user, require_case_access, require_role
+from ..services import case_transfer
 from ..services.audit import log_event
 
 router = APIRouter(prefix="/cases", tags=["cases"])
@@ -36,6 +40,46 @@ def list_cases(db: Session = Depends(get_db), user: User = Depends(get_current_u
         return db.query(Case).order_by(Case.updated_at.desc()).all()
     case_ids = [m.case_id for m in db.query(CaseMember).filter(CaseMember.user_id == user.id).all()]
     return db.query(Case).filter(Case.id.in_(case_ids)).order_by(Case.updated_at.desc()).all()
+
+
+@router.post("/import", response_model=CaseOut)
+async def import_case_endpoint(
+    request: Request,
+    password: str = Form(...),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(require_role(Role.admin, Role.lead)),
+):
+    """
+    Imports a .triagercase export (see POST /{case_id}/export) as a
+    brand-new case, owned by whoever imports it. Requires the same
+    password it was exported with.
+    """
+    if not file.filename or not file.filename.lower().endswith(".triagercase"):
+        raise HTTPException(400, "Expected a .triagercase export file")
+
+    upload_dir = Path(tempfile.mkdtemp(prefix="triager_import_upload_"))
+    upload_path = upload_dir / "upload.triagercase"
+    try:
+        size = 0
+        with upload_path.open("wb") as out:
+            while chunk := await file.read(settings.upload_chunk_bytes):
+                size += len(chunk)
+                if size > settings.max_upload_bytes:
+                    raise HTTPException(413, "Import file exceeds the configured maximum upload size")
+                out.write(chunk)
+
+        try:
+            new_case = case_transfer.import_case(upload_path, password, user, db)
+        except case_transfer.CaseTransferError as ex:
+            raise HTTPException(400, str(ex))
+
+        log_event(db, user, "case.import", case_id=new_case.id, target_type="case",
+                  target_id=new_case.id, target_label=new_case.name, request=request)
+        db.commit()
+        return new_case
+    finally:
+        shutil.rmtree(upload_dir, ignore_errors=True)
 
 
 @router.get("/{case_id}", response_model=CaseOut)
@@ -96,6 +140,48 @@ def delete_case(case_id: str, request: Request, db: Session = Depends(get_db),
 
     shutil.rmtree(settings.storage_root / "cases" / case_id, ignore_errors=True)
     return {"ok": True}
+
+
+@router.post("/{case_id}/export")
+def export_case(case_id: str, payload: CaseExportRequest, request: Request,
+                 db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """
+    Downloads a password-protected, portable export of this case
+    (metadata plus its full artifact database) that another analyst can
+    import into any Triager instance via POST /cases/import.
+    """
+    require_case_access(case_id, user, db, need_edit=True)
+    if not payload.password or len(payload.password) < 8:
+        raise HTTPException(400, "Choose a password of at least 8 characters")
+
+    case = db.query(Case).filter(Case.id == case_id).first()
+    if not case:
+        raise HTTPException(404, "Case not found")
+
+    try:
+        out_path, filename = case_transfer.build_export(case_id, payload.password, db)
+    except case_transfer.CaseTransferError as ex:
+        raise HTTPException(400, str(ex))
+
+    log_event(db, user, "case.export", case_id=case_id, target_type="case", target_id=case_id,
+              target_label=case.name, request=request)
+    db.commit()
+
+    def stream_and_cleanup():
+        try:
+            with out_path.open("rb") as f:
+                while True:
+                    chunk = f.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    yield chunk
+        finally:
+            out_path.unlink(missing_ok=True)
+
+    return StreamingResponse(
+        stream_and_cleanup(), media_type="application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.get("/{case_id}/members", response_model=list[CaseMemberOut])

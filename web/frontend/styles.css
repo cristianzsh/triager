@@ -382,3 +382,27 @@ pre.log-view {
 .finding-flag-box textarea { width: 100%; min-height: 60px; margin-bottom: 8px; }
 .finding-card { cursor: default; }
 .finding-note { font-size: 13px; white-space: pre-wrap; margin: 6px 0 4px; }
+
+/* Scrollbars */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) var(--bg);
+}
+::-webkit-scrollbar { width: 12px; height: 12px; }
+::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 6px;
+  border: 2px solid var(--bg);
+}
+::-webkit-scrollbar-thumb:hover { background: var(--accent-dim); }
+::-webkit-scrollbar-corner { background: var(--bg); }
+
+.panel, .ai-thread, .sidebar, .modal-body, .table-scroll {
+  scrollbar-color: var(--border) var(--panel);
+}
+.panel::-webkit-scrollbar-track, .ai-thread::-webkit-scrollbar-track,
+.sidebar::-webkit-scrollbar-track, .modal-body::-webkit-scrollbar-track,
+.table-scroll::-webkit-scrollbar-track {
+  background: var(--panel);
+}

@@ -164,9 +164,7 @@ async function api(path, { method = "GET", body, headers = {}, raw = false } = {
 
 // A plain <a href> can't carry the Bearer token -- fetch with the auth
 // header, then hand the browser a blob URL to download.
-async function downloadAuthenticated(url, filename) {
-  const resp = await api(url, { raw: true });
-  const blob = await resp.blob();
+function triggerBlobDownload(blob, filename) {
   const objectUrl = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = objectUrl;
@@ -175,6 +173,12 @@ async function downloadAuthenticated(url, filename) {
   a.click();
   a.remove();
   setTimeout(() => URL.revokeObjectURL(objectUrl), 4000);
+}
+
+async function downloadAuthenticated(url, filename) {
+  const resp = await api(url, { raw: true });
+  const blob = await resp.blob();
+  triggerBlobDownload(blob, filename);
 }
 
 // For data already fetched client-side (IOC scan results), building the
@@ -186,14 +190,7 @@ function downloadClientCsv(filename, headers, rows) {
   };
   const lines = [headers, ...rows].map((r) => r.map(escapeCell).join(","));
   const blob = new Blob([lines.join("\r\n")], { type: "text/csv;charset=utf-8" });
-  const objectUrl = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = objectUrl;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  setTimeout(() => URL.revokeObjectURL(objectUrl), 4000);
+  triggerBlobDownload(blob, filename);
 }
 
 // auth
@@ -429,7 +426,7 @@ async function renderCasesView() {
   main.innerHTML = `
     <h2>Cases</h2>
     <div class="subtitle">${cases.length} case(s) visible to you</div>
-    ${canCreate ? `<div class="toolbar"><button class="primary" id="new-case-btn">+ New case</button></div>` : ""}
+    ${canCreate ? `<div class="toolbar"><button class="primary" id="new-case-btn">+ New case</button><button id="import-case-btn">Import case</button></div>` : ""}
     <div class="grid" id="cases-grid"></div>
   `;
   const grid = document.getElementById("cases-grid");
@@ -463,6 +460,7 @@ async function renderCasesView() {
 
   if (canCreate) {
     document.getElementById("new-case-btn").addEventListener("click", showNewCaseForm);
+    document.getElementById("import-case-btn").addEventListener("click", showImportCaseModal);
   }
 }
 
@@ -641,6 +639,7 @@ function renderMachinesView() {
     <div class="subtitle">${state.machines.length} machine(s) in this case.</div>
     <div class="toolbar">
       ${!isClosed && !isReadOnly() ? `<button class="primary" id="new-machine-btn">+ Add machine</button>` : ""}
+      ${!isReadOnly() ? `<button id="export-case-btn">Export case</button>` : ""}
       ${canManageCase ? `<button id="toggle-case-status-btn">${isClosed ? "Reopen case" : "Close case"}</button>` : ""}
       ${canManageCase ? `<button class="danger" id="delete-case-btn">Delete case</button>` : ""}
     </div>
@@ -677,6 +676,9 @@ function renderMachinesView() {
   });
   const newBtn = document.getElementById("new-machine-btn");
   if (newBtn) newBtn.addEventListener("click", showNewMachineForm);
+
+  const exportBtn = document.getElementById("export-case-btn");
+  if (exportBtn) exportBtn.addEventListener("click", showExportCaseModal);
 
   const toggleBtn = document.getElementById("toggle-case-status-btn");
   if (toggleBtn) {
@@ -1078,6 +1080,66 @@ function showModal(title, bodyHtml) {
 function closeModal() {
   const existing = document.getElementById("modal-overlay");
   if (existing) existing.remove();
+}
+
+function showExportCaseModal() {
+  showModal("Export case", `
+    <p class="hint">Packages this case's metadata, findings, AI conversation history, and full artifact database into a single password-protected file another analyst can import into their own Triager instance. Share the file and the password through separate channels.</p>
+    <div class="form-row"><label>Password (at least 8 characters)</label><input type="password" id="export-pw" autocomplete="new-password" /></div>
+    <div class="form-row"><label>Confirm password</label><input type="password" id="export-pw2" autocomplete="new-password" /></div>
+    <div id="export-status" class="hint"></div>
+    <button class="primary" id="export-confirm-btn">Export</button>
+  `);
+  document.getElementById("export-confirm-btn").addEventListener("click", async () => {
+    const pw = document.getElementById("export-pw").value;
+    const pw2 = document.getElementById("export-pw2").value;
+    const statusEl = document.getElementById("export-status");
+    if (!pw || pw.length < 8) { statusEl.textContent = "Password must be at least 8 characters."; return; }
+    if (pw !== pw2) { statusEl.textContent = "Passwords don't match."; return; }
+    statusEl.textContent = "Building export -- this can take a while for a large case...";
+    try {
+      const resp = await api(`/cases/${state.currentCase.id}/export`, {
+        method: "POST", body: { password: pw }, raw: true,
+      });
+      const blob = await resp.blob();
+      const disposition = resp.headers.get("content-disposition") || "";
+      const match = disposition.match(/filename="([^"]+)"/);
+      const filename = match ? match[1] : `${state.currentCase.name || "case"}.triagercase`;
+      triggerBlobDownload(blob, filename);
+      closeModal();
+    } catch (ex) {
+      statusEl.textContent = `Error: ${ex.message}`;
+    }
+  });
+}
+
+function showImportCaseModal() {
+  showModal("Import case", `
+    <p class="hint">Imports a .triagercase export from another analyst as a brand-new case in this system.</p>
+    <div class="form-row"><label>Export file (.triagercase)</label><input type="file" id="import-file" accept=".triagercase" /></div>
+    <div class="form-row"><label>Password</label><input type="password" id="import-pw" autocomplete="current-password" /></div>
+    <div id="import-status" class="hint"></div>
+    <button class="primary" id="import-confirm-btn">Import</button>
+  `);
+  document.getElementById("import-confirm-btn").addEventListener("click", async () => {
+    const fileInput = document.getElementById("import-file");
+    const pw = document.getElementById("import-pw").value;
+    const statusEl = document.getElementById("import-status");
+    const file = fileInput.files[0];
+    if (!file) { statusEl.textContent = "Choose a .triagercase file first."; return; }
+    if (!pw) { statusEl.textContent = "Enter the export's password."; return; }
+    statusEl.textContent = "Importing -- this can take a while for a large case...";
+    const form = new FormData();
+    form.append("password", pw);
+    form.append("file", file);
+    try {
+      const newCase = await api("/cases/import", { method: "POST", body: form });
+      closeModal();
+      openCase(newCase.id);
+    } catch (ex) {
+      statusEl.textContent = `Error: ${ex.message}`;
+    }
+  });
 }
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") closeModal();

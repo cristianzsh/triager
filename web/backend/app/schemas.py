@@ -81,6 +81,10 @@ class CaseStatusUpdate(BaseModel):
     status: CaseStatus
 
 
+class CaseExportRequest(BaseModel):
+    password: str
+
+
 # Machines
 class MachineCreate(BaseModel):
     label: Optional[str] = None  # defaults to "Machine N" if omitted
