@@ -43,9 +43,8 @@ Triager Web Console builds on the same parsing engine and adds:
 - Export and import cases across different analyst instances
 
 <img src="images/web_machine.png"/>
-<img src="images/web_ai_summary.png"/>
-<img src="images/web_filter.png"/>
-<img src="images/web_ai_report.png"/>
+<img src="images/web_ai.png"/>
+<img src="images/web_correlation.png"/>
 
 ## Quick start
 
