@@ -187,6 +187,25 @@ copies it into `bin/` at the repository root, and starts the Web Console from th
 
 Run `Triager` with the `--update` option to get the latest release available.
 
+## How to cite this work
+
+`Triager` was presented at the XXVI Brazilian Symposium on Cybersecurity (SBSeg 2026).
+
+```
+@inproceedings{souza2026triager,
+  author = {Cristian Souza and Eduardo Chavarro and Daniel Batista},
+  title = {Triager: An Open-Source Platform for Automated Forensic Triage and Investigation},
+  booktitle = {Anais Estendidos do XXVI Simpósio Brasileiro de Cibersegurança},
+  location = {Armação dos Búzios/RJ},
+  year = {2026},
+  pages = {251--259},
+  publisher = {SBC},
+  address = {Porto Alegre, RS, Brasil},
+  doi = {10.5753/sbseg_estendido.2026.33554},
+  url = {https://sol.sbc.org.br/index.php/sbseg_estendido/article/view/44472}
+}
+```
+
 ## License
 
 `Triager` is released under the MIT License. See [LICENSE](LICENSE).
