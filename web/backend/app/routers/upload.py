@@ -31,7 +31,7 @@ async def upload_zip(
     user: User = Depends(get_current_user),
 ):
     """
-    Streams a large .zip (evidence collection or pre-processed Triager
+    Streams a large .zip or .tar.gz (evidence collection or pre-processed Triager
     output, for this one machine) to disk in chunks, never loads the
     whole archive into memory, so multi-hundred-GB evidence sets are fine
     on modest RAM.
@@ -39,8 +39,8 @@ async def upload_zip(
     require_case_access(case_id, user, db, need_edit=True)
     _get_machine(case_id, machine_id, db)
 
-    if not file.filename.lower().endswith(".zip"):
-        raise HTTPException(400, "Only .zip archives are accepted")
+    if not file.filename.lower().endswith((".zip", ".tar.gz", ".tgz", ".tar")):
+        raise HTTPException(400, "Only .zip or .tar.gz archives are accepted")
 
     upload_id = uuid.uuid4().hex
     upload_dir = settings.storage_root / "uploads" / upload_id
@@ -87,8 +87,8 @@ def ingest(
             ).first()
             if not custom_config:
                 raise HTTPException(404, "Selected custom config not found")
-        elif payload.triage_profile not in ("velociraptor", "aralez"):
-            raise HTTPException(400, "triage_profile must be 'velociraptor' or 'aralez', or pass custom_config_id")
+        elif payload.triage_profile not in ("velociraptor", "aralez", "uac"):
+            raise HTTPException(400, "triage_profile must be 'velociraptor', 'aralez' or 'uac', or pass custom_config_id")
 
     upload_zip_path = settings.storage_root / "uploads" / payload.upload_id / "archive.zip"
     if not upload_zip_path.exists():

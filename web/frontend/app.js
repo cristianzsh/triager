@@ -1217,15 +1217,22 @@ async function mountAiConversation(host, { conversationKey, askExtra, templates,
     });
   }
 
-  function appendTurn(thread, m) {
+  function buildTurn(m) {
     if (m.role === "user") {
-      thread.appendChild(el(`
+      return el(`
         <div class="ai-turn ai-turn-user">
           <div class="ai-turn-label">You</div>
           <div class="ai-turn-text">${escapeHtml(m.content)}</div>
         </div>
-      `));
-      return;
+      `);
+    }
+    if (m.role === "error") {
+      return el(`
+        <div class="ai-turn ai-turn-error">
+          <div class="ai-turn-label">Error</div>
+          <div class="ai-turn-text">${escapeHtml(m.content)}</div>
+        </div>
+      `);
     }
     const turn = el(`
       <div class="ai-turn ai-turn-assistant">
@@ -1251,7 +1258,23 @@ async function mountAiConversation(host, { conversationKey, askExtra, templates,
       const ok = await copyRichHtml(renderedEl.innerHTML, renderedEl.innerText);
       flashLabel(e.target, "Copy Rendered", ok);
     });
-    thread.appendChild(turn);
+    return turn;
+  }
+
+  function appendTurn(thread, m) {
+    thread.appendChild(buildTurn(m));
+  }
+
+  function buildThinkingTurn() {
+    return el(`
+      <div class="ai-turn ai-turn-assistant ai-turn-thinking">
+        <div class="ai-turn-label">AI</div>
+        <div class="ai-thinking-row">
+          <div class="ai-thinking"><span></span><span></span><span></span></div>
+          <span class="ai-thinking-elapsed"></span>
+        </div>
+      </div>
+    `);
   }
 
   async function loadHistory() {
@@ -1281,23 +1304,45 @@ async function mountAiConversation(host, { conversationKey, askExtra, templates,
       return;
     }
     const questionEl = document.getElementById("aic-question");
+    const askBtn = document.getElementById("aic-ask");
     const question = questionEl.value.trim();
     if (!question) return;
-    statusEl.textContent = "Thinking...";
+
+    const thread = document.getElementById("aic-thread");
+    if (thread.children.length === 1 && thread.children[0].classList.contains("hint")) thread.innerHTML = "";
+    appendTurn(thread, { role: "user", content: question });
+    const pending = buildThinkingTurn();
+    thread.appendChild(pending);
+    thread.scrollTop = thread.scrollHeight;
+
+    pending.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    questionEl.value = "";
+    askBtn.disabled = true;
+    askBtn.textContent = "Asking...";
+    statusEl.textContent = "";
+
+    const startedAt = Date.now();
+    const elapsedEl = pending.querySelector(".ai-thinking-elapsed");
+    const ticker = setInterval(() => {
+      const secs = Math.round((Date.now() - startedAt) / 1000);
+      elapsedEl.textContent = secs >= 60 ? `${Math.floor(secs / 60)}m ${secs % 60}s` : `${secs}s`;
+    }, 1000);
+
     try {
       const resp = await api(`/cases/${state.currentCase.id}/ai/ask`, {
         method: "POST",
         body: { ...aiRequestBase(cfgNow), conversation_key: conversationKey, question, ...(typeof askExtra === "function" ? askExtra() : askExtra) },
       });
+      pending.replaceWith(buildTurn({ role: "assistant", content: resp.answer }));
       statusEl.textContent = resp.truncated ? "Context was truncated to fit the model." : "";
-      const thread = document.getElementById("aic-thread");
-      if (thread.children.length === 1 && thread.children[0].classList.contains("hint")) thread.innerHTML = "";
-      appendTurn(thread, { role: "user", content: question });
-      appendTurn(thread, { role: "assistant", content: resp.answer });
-      thread.scrollTop = thread.scrollHeight;
-      questionEl.value = "";
     } catch (ex) {
-      statusEl.textContent = `Error: ${ex.message}`;
+      pending.replaceWith(buildTurn({ role: "error", content: ex.message }));
+      questionEl.value = question;  // nothing typed is lost on a failed ask
+    } finally {
+      clearInterval(ticker);
+      askBtn.disabled = false;
+      askBtn.textContent = "Ask";
+      thread.scrollTop = thread.scrollHeight;
     }
   });
 
@@ -1767,7 +1812,9 @@ async function renderIngestWizard() {
     return;
   }
   const customConfigs = await api("/configs");
-  const availableParsers = await api("/triager/parsers");
+  const [windowsParsers, unixParsers] = await Promise.all([
+    api("/triager/parsers?platform=windows"), api("/triager/parsers?platform=unix"),
+  ]);
   main.innerHTML = `
     <div class="breadcrumb"><a href="#" id="bc-machines">Machines</a> / ${state.currentMachine.label}</div>
     <h2>Ingest evidence -- ${state.currentMachine.label}</h2>
@@ -1784,8 +1831,9 @@ async function renderIngestWizard() {
       <div class="form-row" id="profile-row">
         <label>Triage collection profile</label>
         <select id="ing-profile">
-          <option value="velociraptor">Velociraptor</option>
-          <option value="aralez">Aralez</option>
+          <option value="velociraptor">Velociraptor (Windows)</option>
+          <option value="aralez">Aralez (Windows)</option>
+          <option value="uac">UAC (Linux / Unix)</option>
           ${customConfigs.map((c) => `<option value="custom:${c.id}">Custom: ${escapeHtml(c.name)}</option>`).join("")}
           <option value="__custom_new__">Custom config -- upload a new .yml file</option>
         </select>
@@ -1799,9 +1847,7 @@ async function renderIngestWizard() {
       </div>
       <div class="form-row" id="exclude-parsers-row">
         <label>Skip specific parsers (optional)</label>
-        <div class="chip-box">
-          ${availableParsers.length ? availableParsers.map((p) => `<label class="chip"><input type="checkbox" class="exclude-parser-chk" value="${escapeAttr(p)}" style="width:auto"/> ${escapeHtml(p)}</label>`).join("") : `<span class="hint">Parser list unavailable.</span>`}
-        </div>
+        <div class="chip-box" id="exclude-parsers-box"></div>
       </div>
       <div class="form-row">
         <label><input type="checkbox" id="ing-skip-large" style="width:auto"/> Skip large files</label>
@@ -1811,8 +1857,8 @@ async function renderIngestWizard() {
         </div>
       </div>
       <div class="form-row">
-        <label>ZIP file</label>
-        <input id="ing-file" type="file" accept=".zip" />
+        <label>Archive (.zip or .tar.gz)</label>
+        <input id="ing-file" type="file" accept=".zip,.tar.gz,.tgz,.tar" />
       </div>
       <div class="hint" id="upload-progress"></div>
       <button class="primary" id="ing-start">Upload &amp; start</button>
@@ -1831,11 +1877,27 @@ async function renderIngestWizard() {
     if (!isEvidence) document.getElementById("custom-config-row").style.display = "none";
     else updateCustomConfigRow();
   });
-  document.getElementById("ing-profile").addEventListener("change", updateCustomConfigRow);
+  document.getElementById("ing-profile").addEventListener("change", () => { updateCustomConfigRow(); renderParserChips(); });
   function updateCustomConfigRow() {
     document.getElementById("custom-config-row").style.display =
       document.getElementById("ing-profile").value === "__custom_new__" ? "block" : "none";
   }
+
+  function renderParserChips() {
+    const profile = document.getElementById("ing-profile").value;
+    const chip = (p) => `<label class="chip"><input type="checkbox" class="exclude-parser-chk" value="${escapeAttr(p)}" style="width:auto"/> ${escapeHtml(p)}</label>`;
+    let html;
+    if (profile === "uac") {
+      html = unixParsers.map(chip).join("");
+    } else if (profile === "velociraptor" || profile === "aralez") {
+      html = windowsParsers.map(chip).join("");
+    } else {
+      html = `<div class="hint" style="width:100%">Windows</div>${windowsParsers.map(chip).join("")}`
+           + `<div class="hint" style="width:100%;margin-top:6px">Linux / Unix</div>${unixParsers.map(chip).join("")}`;
+    }
+    document.getElementById("exclude-parsers-box").innerHTML = html || `<span class="hint">Parser list unavailable.</span>`;
+  }
+  renderParserChips();
 
   document.getElementById("ing-start").addEventListener("click", startIngest);
 }
@@ -1843,7 +1905,7 @@ async function renderIngestWizard() {
 async function startIngest() {
   const fileInput = document.getElementById("ing-file");
   const file = fileInput.files[0];
-  if (!file) { alert("Choose a .zip file first"); return; }
+  if (!file) { alert("Choose a .zip or .tar.gz file first"); return; }
   const kind = document.getElementById("ing-kind").value;
   const profile = document.getElementById("ing-profile").value;
   const progressEl = document.getElementById("upload-progress");

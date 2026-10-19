@@ -1,12 +1,11 @@
 """
-Safe ZIP extraction for both evidence collections and pre-processed Triager
-output archives. Ported from Triager's own _extract_zip_to_temp, but writes
-into a stable, case-scoped directory (not a temp dir that gets wiped), and
-extracts in a background thread since evidence archives can be tens of GB.
+Safe ZIP/tar extraction for both evidence collections (KAPE/Velociraptor
+zips, UAC tar.gz) and pre-processed Triager output archives.
 """
 import hashlib
 import os
 import shutil
+import tarfile
 import time
 import zipfile
 from pathlib import Path
@@ -17,7 +16,7 @@ ILLEGAL_CHARS = set('<>:"/\\|?*')
 
 def _sanitize_component(s: str) -> str:
     s = "".join("_" if (c in ILLEGAL_CHARS or ord(c) < 32) else c for c in s)
-    s = s.strip(" .")
+    s = s.rstrip(" .")  # trailing only: leading dots are Unix dotfiles
     return s or "_"
 
 
@@ -40,14 +39,14 @@ def _truncate_path(p: Path, max_name: int = 120) -> Path:
     return p.with_name(f"{stem[:keep]}_{h}{ext}")
 
 
-def _apply_zip_mtime(path: Path, zi: zipfile.ZipInfo) -> None:
-    """Better than every extracted file silently looking like
-    it was touched right now."""
+def is_tar_archive(path: Path) -> bool:
+    name = path.name.lower()
+    if name.endswith((".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz", ".tar")):
+        return True
     try:
-        ts = time.mktime(zi.date_time + (0, 0, -1))
-        os.utime(path, (ts, ts))
-    except (ValueError, OverflowError, OSError):
-        pass  # some entries carry an all-zero/invalid date; leave extraction time as-is
+        return tarfile.is_tarfile(path)
+    except Exception:
+        return False
 
 
 def extract_zip(
@@ -67,44 +66,79 @@ def extract_zip(
     written to disk (size is already known from the archive's own
     central directory, so this is free to check).
     """
-    if not zipfile.is_zipfile(zip_path):
-        raise ValueError(f"Not a valid zip file: {zip_path}")
+    is_tar = is_tar_archive(zip_path)
+    if not is_tar and not zipfile.is_zipfile(zip_path):
+        raise ValueError(f"Not a valid zip or tar archive: {zip_path}")
 
     dest_root.mkdir(parents=True, exist_ok=True)
     warned = 0
     skipped_large = 0
     skipped_large_bytes = 0
 
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        members = [zi for zi in zf.infolist() if not zi.filename.endswith("/")]
-        total = len(members)
-        for i, zi in enumerate(members, 1):
-            raw_name = zi.filename.replace("\\", "/")
-
-            if skip_large_files and max_file_size_bytes and zi.file_size > max_file_size_bytes:
-                skipped_large += 1
-                skipped_large_bytes += zi.file_size
-                if log_cb:
-                    log_cb(
-                        f"Skipping large file ({zi.file_size / (1024 * 1024):.1f} MB, "
-                        f"over {max_file_size_bytes / (1024 * 1024):.0f} MB limit): {zi.filename}"
-                    )
-                if progress_cb:
-                    progress_cb(i, total)
-                continue
-
+    def _write_member(i: int, total: int, raw_name: str, size: int, mtime: float | None, opener) -> None:
+        nonlocal warned, skipped_large, skipped_large_bytes
+        if skip_large_files and max_file_size_bytes and size > max_file_size_bytes:
+            skipped_large += 1
+            skipped_large_bytes += size
+            if log_cb:
+                log_cb(
+                    f"Skipping large file ({size / (1024 * 1024):.1f} MB, "
+                    f"over {max_file_size_bytes / (1024 * 1024):.0f} MB limit): {raw_name}"
+                )
+        else:
             try:
-                out_path = _safe_join(dest_root, raw_name)
-                out_path = _truncate_path(out_path)
+                out_path = _truncate_path(_safe_join(dest_root, raw_name))
                 out_path.parent.mkdir(parents=True, exist_ok=True)
-                with zf.open(zi, "r") as src, out_path.open("wb") as dst:
+                with opener() as src, out_path.open("wb") as dst:
                     shutil.copyfileobj(src, dst, length=1024 * 1024)
-                _apply_zip_mtime(out_path, zi)
+                if mtime is not None:
+                    try:
+                        os.utime(out_path, (mtime, mtime))
+                    except (ValueError, OverflowError, OSError):
+                        pass
             except Exception:
                 warned += 1
-                continue
-            if progress_cb:
-                progress_cb(i, total)
+        if progress_cb:
+            progress_cb(i, total)
+
+    if is_tar:
+        with tarfile.open(zip_path, "r:*") as tf:
+            members = [m for m in tf.getmembers() if not m.isdir()]
+            total = len(members)
+            for i, m in enumerate(members, 1):
+                raw_name = m.name.replace("\\", "/")
+                if m.issym() or m.islnk():
+                    if os.name != "nt":
+                        try:
+                            out_path = _truncate_path(_safe_join(dest_root, raw_name))
+                            out_path.parent.mkdir(parents=True, exist_ok=True)
+                            if not out_path.exists() and not out_path.is_symlink():
+                                os.symlink(m.linkname, out_path)
+                                if m.mtime:
+                                    try:
+                                        os.utime(out_path, (m.mtime, m.mtime), follow_symlinks=False)
+                                    except (NotImplementedError, OSError):
+                                        pass
+                        except Exception:
+                            warned += 1
+                    if progress_cb:
+                        progress_cb(i, total)
+                    continue
+                if not m.isfile():
+                    continue
+                _write_member(i, total, raw_name, m.size, float(m.mtime) if m.mtime else None,
+                              lambda m=m: tf.extractfile(m))
+    else:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            members = [zi for zi in zf.infolist() if not zi.filename.endswith("/")]
+            total = len(members)
+            for i, zi in enumerate(members, 1):
+                try:
+                    mtime = time.mktime(zi.date_time + (0, 0, -1))
+                except (ValueError, OverflowError):
+                    mtime = None
+                _write_member(i, total, zi.filename.replace("\\", "/"), zi.file_size, mtime,
+                              lambda zi=zi: zf.open(zi, "r"))
 
     if skipped_large and log_cb:
         log_cb(

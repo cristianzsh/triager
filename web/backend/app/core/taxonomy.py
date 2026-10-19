@@ -20,17 +20,18 @@ CATEGORIES: dict[str, dict] = {
         "folder": "Evidence of execution",
         "subfolders": [
             "AmCache", "Prefetch", "SRUM", "WER", "WindowsDefenderDetection", "PCA",
+            "Processes", "SudoCommands", "PackageHistory",
         ],
     },
     "filesystem": {
         "label": "File System Artifacts",
         "folder": "File system artifacts",
-        "subfolders": ["LogFile", "MFT", "RecycleBin", "USNJournal"],
+        "subfolders": ["LogFile", "MFT", "RecycleBin", "USNJournal", "Bodyfile", "SuspiciousFiles"],
     },
     "persistence": {
         "label": "Persistence",
         "folder": "Persistence",
-        "subfolders": ["ScheduledTasks", "WMI"],
+        "subfolders": ["ScheduledTasks", "WMI", "Cron", "Systemd", "InitScripts", "ShellStartup", "SSHKeys", "Launchd", "KernelModules"],
     },
     "registry": {
         "label": "Registry",
@@ -44,7 +45,19 @@ CATEGORIES: dict[str, dict] = {
             "BrowserHistory", "Certutil", "JumpLists", "MUICache", "NotepadFiles",
             "NTUSER_Artifacts", "PSReadLine", "RDPCache", "RecentLnk", "Shellbags",
             "Thumbnails", "UserAssist", "Win10Timelines",
+            "ShellHistory", "RecentFiles",
         ],
+    },
+    # Unix-specific (UAC)
+    "logs": {
+        "label": "Logs",
+        "folder": "Logs",
+        "subfolders": ["SystemLogs", "Logins", "Auditd"],
+    },
+    "system_config": {
+        "label": "System Configuration",
+        "folder": "System configuration",
+        "subfolders": ["Accounts", "Network", "Storage"],
     },
     "meta": {
         "label": "Case Meta / Host Profile",

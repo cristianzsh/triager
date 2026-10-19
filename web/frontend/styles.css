@@ -296,6 +296,25 @@ pre.log-view {
 .ai-turn-text { font-size: 13px; white-space: pre-wrap; }
 .ai-turn-actions { display: flex; gap: 8px; margin-top: 10px; }
 .ai-turn-actions button { font-size: 11px; padding: 4px 10px; }
+.ai-turn-error { background: var(--panel); border-left: 3px solid var(--danger); }
+.ai-turn-error .ai-turn-label { color: var(--danger); }
+
+/* Pending-answer bubble: three pulsing dots in the assistant's accent, plus elapsed time */
+.ai-thinking-row { display: flex; align-items: center; gap: 12px; }
+.ai-thinking-elapsed { font-family: var(--mono); font-size: 11px; color: var(--text-dim); }
+.ai-thinking { display: inline-flex; gap: 5px; align-items: center; height: 18px; padding: 2px 0; }
+.ai-thinking span {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--accent);
+  opacity: 0.35;
+  animation: ai-thinking-pulse 1.2s infinite ease-in-out;
+}
+.ai-thinking span:nth-child(2) { animation-delay: 0.2s; }
+.ai-thinking span:nth-child(3) { animation-delay: 0.4s; }
+@keyframes ai-thinking-pulse {
+  0%, 80%, 100% { opacity: 0.35; transform: translateY(0); }
+  40% { opacity: 1; transform: translateY(-3px); }
+}
 
 /* Rendered Markdown inside an assistant turn, kept readable within
    the app's type scale rather than inheriting raw <h1>/<p> browser defaults. */

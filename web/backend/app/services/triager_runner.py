@@ -82,8 +82,22 @@ PARSER_NAMES = [
 ]
 
 
-def list_parser_names() -> list[str]:
-    return PARSER_NAMES
+UNIX_PARSER_NAMES = [
+    "Processes", "SudoCommands", "PackageHistory",
+    "Cron", "Systemd", "InitScripts", "ShellStartup", "SSHKeys", "Launchd", "KernelModules",
+    "Accounts", "Network", "Storage",
+    "ShellHistory", "RecentFiles", "BrowserHistory",
+    "SuspiciousFiles", "Bodyfile",
+    "SystemLogs", "Logins", "Auditd",
+]
+
+
+def list_parser_names(platform: str | None = None) -> list[str]:
+    if platform in ("unix", "linux"):
+        return UNIX_PARSER_NAMES
+    if platform == "windows":
+        return PARSER_NAMES
+    return PARSER_NAMES + [n for n in UNIX_PARSER_NAMES if n not in PARSER_NAMES]
 
 
 def start_triager_job(
@@ -125,7 +139,7 @@ def run_triager(
     config_path: Path | None = None,
     exclude_parsers: list[str] | None = None,
 ) -> None:
-    """Either triage_profile (a built-in "velociraptor"/"aralez" name,
+    """Either triage_profile (a built-in "velociraptor"/"aralez"/"uac" name,
     passed as --profile) or config_path (a specific .yml on disk, passed
     as -c) should be given; config_path takes precedence if both are."""
     db = SessionLocal()

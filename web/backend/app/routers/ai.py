@@ -32,12 +32,14 @@ MAX_TABLE_SNIPPET_CHARS = 150_000
 MAX_ROWS_PER_TABLE_CEILING = 5_000
 
 _CATEGORY_WEIGHTS = {
-    "execution_evidence": 4.0,  # Amcache, Prefetch, SRUM, WER, PCA -- what ran, when
-    "persistence": 3.0,         # ScheduledTasks, WMI -- how it stays around
-    "registry": 3.0,            # Shimcache, BAM/DAM, USB -- also execution/device evidence
+    "execution_evidence": 4.0,  # Amcache, Prefetch, SRUM, WER, PCA - what ran, when
+    "persistence": 3.0,         # ScheduledTasks, WMI - how it stays around
+    "registry": 3.0,
+    "system_config": 3.0,       # Shimcache, BAM/DAM, USB - also execution/device evidence
     "user_artifacts": 2.0,      # UserAssist, JumpLists, browser history, etc.
     "filesystem": 1.5,          # MFT, USN Journal, LogFile, RecycleBin
     "event_logs": 1.0,
+    "logs": 1.0,
     "meta": 0.5,
 }
 _DEFAULT_CATEGORY_WEIGHT = 1.0

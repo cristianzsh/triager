@@ -15,6 +15,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tarfile
 import tempfile
 import traceback
 import zipfile
@@ -438,11 +439,25 @@ UserHives:
   USRCLASSGlob: "Users\\*\\AppData\\Local\\Microsoft\\Windows\\UsrClass.dat"
 """
 
+UAC_CONFIG_YAML = r"""
+platform: unix
+root: "/cases/sample_001/uac-hostname-linux-20260908"
+
+# UAC (Unix-like Artifacts Collector) layout, relative to the triage root
+Root: "[root]"
+LiveResponse: "live_response"
+Bodyfile: "bodyfile/bodyfile.txt"
+HashExecutables: "hash_executables"
+SystemFindings: "system"
+UacLog: "uac.log"
+"""
+
 # Maps --profile name -> embedded config YAML text. Used as the default
 # config source when -c/--config isn't given.
 CONFIG_PROFILES: dict[str, str] = {
     "velociraptor": VELOCIRAPTOR_CONFIG_YAML,
     "aralez": ARALEZ_CONFIG_YAML,
+    "uac": UAC_CONFIG_YAML,
 }
 DEFAULT_CONFIG_PROFILE = "velociraptor"
 
@@ -484,7 +499,9 @@ OUTPUT_SUBDIRS: dict[str, str] = {
     "LogFile": "File system artifacts",
     "Users": "User artifacts",
     "Registry": "Registry",
+    "SystemConfig": "System configuration", # Unix: accounts, sudoers, network, mounts
     "EventLogs": "Event logs",
+    "Logs": "Logs", # Unix: syslog/auth/kern + login records
     "Meta": "Meta",
 }
 
@@ -610,13 +627,6 @@ def apply_overrides(cfg: JSONDict, args: argparse.Namespace) -> JSONDict:
     if args.root:
         new_cfg["root"] = args.root
 
-    #if args.set:
-    #    for kv in args.set:
-    #        if "=" not in kv:
-    #            raise ValueError(f"Invalid --set value (expected key=value): {kv}")
-    #        k, v = kv.split("=", 1)
-    #        _set_nested(new_cfg, k.strip(), v.strip())
-
     return new_cfg
 
 
@@ -628,8 +638,13 @@ def build_paths(cfg: JSONDict) -> JSONDict:
     if not root.exists():
         raise FileNotFoundError(f"Triage root does not exist: {root}")
 
+    platform = str(cfg.get("platform", "windows")).lower()
+    if platform == "linux": # accepted alias
+        platform = "unix"
+    keys = UNIX_ARTIFACT_KEYS if platform == "unix" else ARTIFACT_KEYS
+
     artifact_paths: PathMap = {}
-    for key in ARTIFACT_KEYS:
+    for key in keys:
         rel = cfg.get(key)
         if rel:
             artifact_paths[key] = (root / str(rel)).resolve()
@@ -648,21 +663,23 @@ def build_paths(cfg: JSONDict) -> JSONDict:
 
     return {
         "root": root,
+        "platform": platform,
         "artifact_paths": artifact_paths,
         "hive_paths": hive_paths,
         "user_hive_globs": user_hive_globs,
     }
 
 
-def create_main_dir(output_dir: Path) -> dict[str, Path]:
+def create_main_dir(output_dir: Path, platform: str = "windows") -> dict[str, Path]:
     if output_dir.exists():
         log_error(f"Output directory already exists: {output_dir}")
         sys.exit(1)
 
     output_dir.mkdir(parents=True, exist_ok=False)
 
-    # Create unique folders once (multiple keys map to same folder)
-    for folder in set(OUTPUT_SUBDIRS.values()):
+    # Registry and "Event logs" are Windows terms; Unix gets System configuration and Logs.
+    skip = {"System configuration", "Logs"} if platform != "unix" else {"Registry", "Event logs"}
+    for folder in set(OUTPUT_SUBDIRS.values()) - skip:
         (output_dir / folder).mkdir(parents=True, exist_ok=True)
 
     outdirs: dict[str, Path] = {}
@@ -695,7 +712,7 @@ def compress_output_directory(output_dir: Path) -> Path | None:
     "<output_dir_name>.zip".
     """
     HEARTBEAT_SECONDS = 15
-    LARGE_FILE_NOTICE_BYTES = 100 * 1024 * 1024  # 100 MB
+    LARGE_FILE_NOTICE_BYTES = 100 * 1024 * 1024 # 100 MB
 
     try:
         output_dir = output_dir.resolve()
@@ -2806,6 +2823,1427 @@ def parse_event_logs(artifact_paths: PathMap, outdirs: dict[str, Path]) -> None:
 
 
 # Orchestration
+
+UNIX_ARTIFACT_KEYS = ["Root", "LiveResponse", "Bodyfile", "HashExecutables", "SystemFindings", "UacLog"]
+
+_UTC = dt.timezone.utc
+
+
+def _lx_root(artifact_paths: PathMap) -> Path | None:
+    p = artifact_paths.get("Root")
+    return p if p and p.exists() else None
+
+
+def _lx_live(artifact_paths: PathMap) -> Path | None:
+    p = artifact_paths.get("LiveResponse")
+    return p if p and p.exists() else None
+
+
+def _lx_read(path: Path) -> str:
+    """Text read that tolerates the mixed encodings of collected logs."""
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def _lx_lines(path: Path) -> list[str]:
+    return _lx_read(path).splitlines() if path.exists() else []
+
+
+def _epoch_to_iso(value: str | int | float) -> str:
+    try:
+        e = float(value)
+        if e <= 0:
+            return ""
+        return dt.datetime.fromtimestamp(e, tz=_UTC).isoformat()
+    except Exception:
+        return ""
+
+
+_TZ_OFFSET_RE = re.compile(r"Local time:.*?([+-]\d{2})(?::?(\d{2}))?\s*$", re.M)
+
+
+def _lx_local_tz(artifact_paths: PathMap) -> dt.timezone:
+    """Host UTC offset at collection time (timedatectl). last, ps lstart,
+    dpkg.log and classic syslog are host-local with no offset; this is
+    what lets them line up with other logs and other hosts."""
+    live = _lx_live(artifact_paths)
+    if live:
+        text = _lx_read(live / "system" / "timedatectl_status.txt")
+        m = _TZ_OFFSET_RE.search(text)
+        if m:
+            hours = int(m.group(1))
+            minutes = int(m.group(2) or 0)
+            sign = -1 if hours < 0 else 1
+            return dt.timezone(dt.timedelta(hours=hours, minutes=sign * minutes))
+    return _UTC
+
+
+def _local_to_utc_iso(naive: dt.datetime, tz: dt.timezone) -> str:
+    return naive.replace(tzinfo=tz).astimezone(_UTC).isoformat()
+
+
+def _lx_user_homes(root: Path) -> list[tuple[str, Path]]:
+    """(username, home) for every home dir, root included. iterdir, not
+    glob: "[root]" is a glob character class."""
+    homes: list[tuple[str, Path]] = []
+    for base in ("home", "Users"):  # Linux/BSD, macOS
+        d = root / base
+        if d.is_dir():
+            for p in sorted(d.iterdir()):
+                if p.is_dir() and p.name != "Shared":
+                    homes.append((p.name, p))
+    if (root / "root").is_dir():
+        homes.append(("root", root / "root"))
+    return homes
+
+
+# Host profile
+
+def collect_unix_host_info(artifact_paths: PathMap, out_meta: Path) -> HostProfile:
+    root = _lx_root(artifact_paths)
+    live = _lx_live(artifact_paths)
+    hp = HostProfile()
+
+    if live:
+        hp.computer_name = _lx_read(live / "network" / "hostname.txt").strip()
+    if not hp.computer_name and root:
+        hp.computer_name = _lx_read(root / "etc" / "hostname").strip()
+
+    # os-release is often a symlink UAC can't follow; fall back to
+    # lsb-release, then installer media-info.
+    if root:
+        for rel in ("etc/os-release", "usr/lib/os-release", "etc/lsb-release"):
+            for line in _lx_lines(root / rel):
+                if line.startswith(("PRETTY_NAME=", "DISTRIB_DESCRIPTION=")):
+                    hp.operating_system = line.split("=", 1)[1].strip().strip('"')
+                    break
+            if hp.operating_system:
+                break
+        if not hp.operating_system:
+            for rel in ("etc/redhat-release", "etc/centos-release", "etc/system-release", "etc/fedora-release",
+                        "etc/SuSE-release", "etc/alpine-release", "etc/arch-release", "etc/debian_version"):
+                text = _lx_read(root / rel).strip()
+                if text:
+                    hp.operating_system = text if "release" in rel.lower() and " " in text else f"{rel.split('/')[-1].split('-')[0].split('_')[0].title()} {text}"
+                    break
+        if not hp.operating_system:
+            hp.operating_system = _lx_read(root / "var" / "log" / "installer" / "media-info").strip()
+    if live:
+        uname = _lx_read(live / "system" / "uname_-a.txt").strip()
+        if uname:
+            kernel = uname.split()[2] if len(uname.split()) > 2 else uname
+            hp.operating_system = f"{hp.operating_system} (kernel {kernel})" if hp.operating_system else uname
+
+    if root:
+        hp.timezone = _lx_read(root / "etc" / "timezone").strip()
+    if not hp.timezone and live:
+        m = re.search(r"Time zone:\s*(\S+)", _lx_read(live / "system" / "timedatectl_status.txt"))
+        if m:
+            hp.timezone = m.group(1)
+
+    if live:
+        for line in _lx_lines(live / "network" / "ip_addr_show.txt"):
+            m = re.match(r"\s*inet (\d+\.\d+\.\d+\.\d+)/\d+", line)
+            if m and not m.group(1).startswith("127."):
+                hp.ip_addresses.append(m.group(1))
+
+    # Install date: the installer log directory is the most direct signal.
+    if root:
+        inst = root / "var" / "log" / "installer"
+        if inst.is_dir():
+            try:
+                oldest = min(p.stat().st_mtime for p in inst.iterdir() if p.is_file())
+                hp.os_install_date = dt.datetime.fromtimestamp(oldest, tz=_UTC).strftime("%Y-%m-%d")
+            except ValueError:
+                pass
+        if not hp.os_install_date:
+            for line in _lx_lines(root / "var" / "log" / "dpkg.log"):
+                if line[:4].isdigit():
+                    hp.os_install_date = line[:10]
+                    break
+
+    # Installed software: dpkg -l ("ii  name  version  arch  description"),
+    # else whichever package manager UAC captured (name[-version] per line).
+    if live:
+        pkg_dir = live / "packages"
+        for line in _lx_lines(pkg_dir / "dpkg_-l.txt"):
+            if not line.startswith("ii"):
+                continue
+            parts = line.split(None, 4)
+            if len(parts) >= 4:
+                hp.installed_software.append({
+                    "name": parts[1], "version": parts[2], "architecture": parts[3],
+                    "description": parts[4] if len(parts) > 4 else "",
+                })
+        if not hp.installed_software and pkg_dir.is_dir():
+            # rpm's queryformat capture: "installtime~name~version-release"
+            for f in sorted(pkg_dir.glob("rpm_-q_-a_--queryformat*")):
+                for line in _lx_lines(f):
+                    parts = line.strip().split("~")
+                    if len(parts) >= 3 and parts[0].isdigit():
+                        hp.installed_software.append({"name": parts[1], "version": parts[2], "architecture": "",
+                                                      "description": "", "installed": _epoch_to_iso(parts[0]), "source": "rpm"})
+            if not hp.installed_software:
+                for pattern in ("rpm_-q_-a*", "rpm_-qa*", "pacman_-Q*", "apk_info*", "pkg_info*", "pkg_query*", "pkgutil*"):
+                    for f in sorted(pkg_dir.glob(pattern)):
+                        for line in _lx_lines(f):
+                            s = line.strip()
+                            if s and not s.startswith(("WARNING", "error", "Listing")):
+                                name, _, version = s.partition(" ")
+                                hp.installed_software.append({"name": name, "version": version, "architecture": "",
+                                                              "description": "", "source": pattern.split("_")[0]})
+                    if hp.installed_software:
+                        break
+
+    # Autoruns: enabled systemd services + cron entries, for the summary count.
+    if live:
+        for line in _lx_lines(live / "system" / "systemctl_list-unit-files.txt"):
+            parts = line.split()
+            if len(parts) >= 2 and parts[0].endswith((".service", ".timer")) and parts[1] == "enabled":
+                hp.autorun.append({"location": "systemd", "name": parts[0], "command": parts[1]})
+    if root:
+        for job in _lx_iter_cron_jobs(root):
+            hp.autorun.append({"location": job["Source"], "name": job.get("User", ""), "command": job["Command"]})
+
+    hp.summary = f"{hp.computer_name} ({', '.join(hp.ip_addresses)})" if hp.ip_addresses else hp.computer_name
+
+    write_json(out_meta / "host_profile.json", {
+        "COMPUTER_NAME": hp.computer_name,
+        "IP_ADDRESSES": hp.ip_addresses,
+        "OPERATING_SYSTEM": hp.operating_system,
+        "TIMEZONE": hp.timezone,
+        "OS_INSTALL_DATE": hp.os_install_date,
+        "INSTALLED_SOFTWARE_COUNT": len(hp.installed_software),
+        "AUTORUN_COUNT": len(hp.autorun),
+        "PLATFORM": "unix",
+    })
+    write_json(out_meta / "installed_software.json", hp.installed_software)
+    write_json(out_meta / "autoruns.json", hp.autorun)
+    return hp
+
+
+# Evidence of execution
+
+_PS_LSTART_RE = re.compile(r"^\s*(\d+)\s+(\S+)\s+(\w{3} \w{3}\s+\d+ \d{2}:\d{2}:\d{2} \d{4})\s+(.*)$")
+
+
+def parse_unix_processes(artifact_paths: PathMap, outdirs: dict[str, Path]) -> None:
+    live = _lx_live(artifact_paths)
+    if not live:
+        log_warn("Processes: live_response not found; skipping.")
+        return
+    out_dir = outdirs["Prefetch"] / "Processes"
+    tz = _lx_local_tz(artifact_paths)
+
+    # Executable path + hashes, keyed by PID, from the /proc captures.
+    exe_by_pid: dict[str, str] = {}
+    for line in _lx_lines(live / "process" / "running_processes_full_paths.txt"):
+        m = re.search(r"/proc/(\d+)/exe\s*->\s*(.+)$", line)
+        if m:
+            exe_by_pid[m.group(1)] = m.group(2).strip()
+    md5_by_pid: dict[str, str] = {}
+    sha1_by_pid: dict[str, str] = {}
+    for fname, target in (("hash_running_processes.md5", md5_by_pid), ("hash_running_processes.sha1", sha1_by_pid)):
+        for line in _lx_lines(live / "process" / fname):
+            m = re.match(r"^([0-9a-f]+)\s+/proc/(\d+)/exe", line)
+            if m:
+                target[m.group(2)] = m.group(1)
+    hidden = {l.strip() for l in _lx_lines(live / "process" / "hidden_pids_for_ps_command.txt") if l.strip().isdigit()}
+
+    rows = []
+    for line in _lx_lines(live / "process" / "ps_-axo_pid_user_lstart_args.txt"):
+        m = _PS_LSTART_RE.match(line)
+        if not m:
+            continue
+        pid, user, started, args = m.groups()
+        try:
+            started_utc = _local_to_utc_iso(dt.datetime.strptime(started, "%a %b %d %H:%M:%S %Y"), tz)
+        except ValueError:
+            started_utc = ""
+        rows.append({
+            "PID": pid, "User": user, "StartTime": started_utc, "Command": args.strip(), "ExecutablePath": exe_by_pid.get(pid, ""),
+            "MD5": md5_by_pid.get(pid, ""), "SHA1": sha1_by_pid.get(pid, ""),
+            "HiddenFromPs": "True" if pid in hidden else "",
+        })
+    # PIDs seen in /proc but absent from ps are their own finding.
+    seen = {r["PID"] for r in rows}
+    for pid in sorted(hidden - seen, key=int):
+        rows.append({"PID": pid, "User": "", "StartTime": "", "Command": "",
+                     "ExecutablePath": exe_by_pid.get(pid, ""), "MD5": md5_by_pid.get(pid, ""),
+                     "SHA1": sha1_by_pid.get(pid, ""), "HiddenFromPs": "True"})
+    if not rows:
+        log_warn("Processes: no ps output found.")
+        return
+    _write_rows_csv(out_dir / "RunningProcesses.csv",
+                    ["PID", "User", "StartTime", "Command", "ExecutablePath", "MD5", "SHA1", "HiddenFromPs"], rows)
+    log_success(f"Processes: {len(rows)} process(es) -> {out_dir}")
+
+
+_SUDO_RE = re.compile(
+    r"^(?P<ts>\d{4}-\d{2}-\d{2}T\S+|\w{3}\s+\d+ \d{2}:\d{2}:\d{2})\s+(?P<host>\S+)\s+sudo(?:\[\d+\])?:\s+"
+    r"(?P<user>\S+)\s*:\s*(?:(?P<result>[^;]+?)\s*;\s*)?"
+    r"TTY=(?P<tty>\S+)\s*;\s*PWD=(?P<pwd>.*?)\s*;\s*USER=(?P<target>\S+)\s*;\s*COMMAND=(?P<cmd>.*)$"
+)
+_SYSLOG_CLASSIC_RE = re.compile(r"^(\w{3}\s+\d+ \d{2}:\d{2}:\d{2})\s+(\S+)\s+(.*)$")
+_SYSLOG_RFC_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T[\d:.]+(?:[+-]\d{2}:\d{2}|Z))\s+(\S+)\s+(.*)$")
+
+
+def _lx_syslog_ts(raw: str, tz: dt.timezone, file_mtime: float) -> str:
+    """Either syslog timestamp style -> UTC ISO. Classic 'Mon DD HH:MM:SS'
+    has no year or offset: the year is the log file's, unless that would
+    put the entry after the file was last written (a Dec->Jan rollover)."""
+    if raw[:4].isdigit():
+        try:
+            d = dt.datetime.fromisoformat(re.sub(r"([+-]\d{2})(\d{2})$", r"\1:\2", raw.replace("Z", "+00:00")))
+            return d.astimezone(_UTC).isoformat()
+        except ValueError:
+            return raw
+    year = dt.datetime.fromtimestamp(file_mtime, tz).year
+    try:
+        d = dt.datetime.strptime(f"{year} {raw}", "%Y %b %d %H:%M:%S").replace(tzinfo=tz)
+        if d.timestamp() > file_mtime + 86400:
+            d = d.replace(year=year - 1)
+        return d.astimezone(_UTC).isoformat()
+    except ValueError:
+        return raw
+
+
+def parse_unix_sudo_commands(artifact_paths: PathMap, outdirs: dict[str, Path]) -> None:
+    root = _lx_root(artifact_paths)
+    if not root:
+        log_warn("SudoCommands: [root] not found; skipping.")
+        return
+    tz = _lx_local_tz(artifact_paths)
+    out_dir = outdirs["Prefetch"] / "SudoCommands"
+    rows = []
+    log_dir = root / "var" / "log"
+    for log in sorted(log_dir.glob("auth.log*")) + sorted(log_dir.glob("secure*")):
+        if not log.is_file() or log.suffix in (".gz", ".xz", ".bz2"):
+            continue
+        mtime = log.stat().st_mtime
+        for line in _lx_lines(log):
+            m = _SUDO_RE.match(line)
+            if not m:
+                continue
+            # "user NOT in sudoers", "command not allowed", "3 incorrect password attempts"
+            # sit between the user and TTY= on a denied attempt; a success has nothing there.
+            result = (m.group("result") or "").strip()
+            rows.append({
+                "Timestamp": _lx_syslog_ts(m.group("ts"), tz, mtime), "Host": m.group("host"),
+                "User": m.group("user").strip(), "RunAs": m.group("target"),
+                "Result": result or "allowed", "TTY": m.group("tty"),
+                "WorkingDir": m.group("pwd"), "Command": m.group("cmd").strip(), "SourceLog": log.name,
+            })
+    if not rows:
+        log_warn("SudoCommands: no sudo COMMAND entries found in auth logs.")
+        return
+    _write_rows_csv(out_dir / "SudoCommands.csv",
+                    ["Timestamp", "Host", "User", "RunAs", "Result", "TTY", "WorkingDir", "Command", "SourceLog"], rows)
+    log_success(f"SudoCommands: {len(rows)} command(s) -> {out_dir}")
+
+
+def parse_unix_package_history(artifact_paths: PathMap, outdirs: dict[str, Path]) -> None:
+    root = _lx_root(artifact_paths)
+    if not root:
+        log_warn("PackageHistory: [root] not found; skipping.")
+        return
+    tz = _lx_local_tz(artifact_paths)
+    out_dir = outdirs["Prefetch"] / "PackageHistory"
+    log_dir = root / "var" / "log"
+
+    # dpkg.log: "YYYY-MM-DD HH:MM:SS <action> <package> <version> [<new version>]"
+    dpkg_rows = []
+    for log in sorted(log_dir.glob("dpkg.log*")):
+        for line in _lx_lines(log):
+            parts = line.split()
+            if len(parts) < 4 or not parts[0][:4].isdigit():
+                continue
+            try:
+                ts = _local_to_utc_iso(dt.datetime.strptime(f"{parts[0]} {parts[1]}", "%Y-%m-%d %H:%M:%S"), tz)
+            except ValueError:
+                ts = f"{parts[0]} {parts[1]}"
+            action = parts[2]
+            if action == "status":
+                dpkg_rows.append({"Timestamp": ts, "Action": f"status {parts[3]}", "Package": parts[4] if len(parts) > 4 else "",
+                                  "Version": parts[5] if len(parts) > 5 else "", "NewVersion": "", "SourceLog": log.name})
+            elif action in ("install", "upgrade", "remove", "purge", "configure", "trigproc"):
+                dpkg_rows.append({"Timestamp": ts, "Action": action, "Package": parts[3],
+                                  "Version": parts[4] if len(parts) > 4 else "", "NewVersion": parts[5] if len(parts) > 5 else "",
+                                  "SourceLog": log.name})
+    if dpkg_rows:
+        _write_rows_csv(out_dir / "DpkgLog.csv", ["Timestamp", "Action", "Package", "Version", "NewVersion", "SourceLog"], dpkg_rows)
+
+    # apt history.log: blank-line-separated blocks with Start-Date/Commandline/Install/Remove/...
+    apt_rows = []
+    for log in sorted((log_dir / "apt").glob("history.log*")) if (log_dir / "apt").is_dir() else []:
+        block: dict[str, str] = {}
+        for line in _lx_lines(log) + [""]:
+            if not line.strip():
+                if block.get("Start-Date"):
+                    try:
+                        ts = _local_to_utc_iso(dt.datetime.strptime(block["Start-Date"].strip(), "%Y-%m-%d %H:%M:%S"), tz)
+                    except ValueError:
+                        ts = block["Start-Date"].strip()
+                    apt_rows.append({
+                        "StartTime": ts, "Commandline": block.get("Commandline", ""), "RequestedBy": block.get("Requested-By", ""),
+                        "Install": block.get("Install", ""), "Upgrade": block.get("Upgrade", ""),
+                        "Remove": block.get("Remove", ""), "Purge": block.get("Purge", ""), "SourceLog": log.name,
+                    })
+                block = {}
+                continue
+            if ":" in line:
+                k, v = line.split(":", 1)
+                block[k.strip()] = re.sub(r"\s+", " ", v.strip())
+    if apt_rows:
+        _write_rows_csv(out_dir / "AptHistory.csv",
+                        ["StartTime", "Commandline", "RequestedBy", "Install", "Upgrade", "Remove", "Purge", "SourceLog"], apt_rows)
+
+    # dnf.rpm.log / yum.log: one line per package transaction.
+    rpm_rows = []
+    rpm_action_re = re.compile(
+        r"^(?P<ts>\S+(?: \d{2}:\d{2}:\d{2})?)\s+(?:\w+\s+)?"
+        r"(?P<action>Installed|Install|Upgraded|Upgrade|Updated|Erased|Erase|Removed|Remove|Cleanup|Downgraded|Downgrade|Reinstalled|Reinstall|Obsoleted|Obsoleting):\s+(?P<pkg>\S+)"
+    )
+    for log in sorted(log_dir.glob("dnf.rpm.log*")) + sorted(log_dir.glob("yum.log*")):
+        if not log.is_file() or log.suffix in (".gz", ".xz", ".bz2"):
+            continue
+        mtime = log.stat().st_mtime
+        for line in _lx_lines(log):
+            m = rpm_action_re.match(line)
+            if not m:
+                continue
+            rpm_rows.append({"Timestamp": _lx_syslog_ts(m.group("ts"), tz, mtime), "Action": m.group("action"),
+                             "Package": m.group("pkg"), "SourceLog": log.name})
+    if rpm_rows:
+        _write_rows_csv(out_dir / "RpmTransactionLog.csv", ["Timestamp", "Action", "Package", "SourceLog"], rpm_rows)
+
+    # dnf history list: "ID | Command line | Date and time | Action(s) | Altered"
+    dnf_rows = []
+    live = _lx_live(artifact_paths)
+    if live:
+        for f in sorted((live / "packages").glob("dnf_history_list*")) + sorted((live / "packages").glob("yum_history_list*")):
+            for line in _lx_lines(f):
+                parts = [c.strip() for c in line.split("|")]
+                if len(parts) < 4 or not parts[0].isdigit():
+                    continue
+                try:
+                    ts = _local_to_utc_iso(dt.datetime.strptime(parts[2], "%Y-%m-%d %H:%M"), tz)
+                except ValueError:
+                    ts = parts[2]
+                dnf_rows.append({"TransactionId": parts[0], "Timestamp": ts, "Commandline": parts[1],
+                                 "Action": parts[3], "Altered": parts[4] if len(parts) > 4 else ""})
+        if dnf_rows:
+            _write_rows_csv(out_dir / "DnfHistory.csv", ["TransactionId", "Timestamp", "Commandline", "Action", "Altered"], dnf_rows)
+
+        # rpm install times: the closest thing to a package timeline on a host with no dnf.rpm.log left.
+        inst_rows = []
+        for f in sorted((live / "packages").glob("rpm_-q_-a_--queryformat*")):
+            for line in _lx_lines(f):
+                parts = line.strip().split("~")
+                if len(parts) >= 3 and parts[0].isdigit():
+                    inst_rows.append({"InstallTime": _epoch_to_iso(parts[0]), "Package": parts[1], "Version": parts[2]})
+        if inst_rows:
+            _write_rows_csv(out_dir / "RpmInstallTimes.csv", ["InstallTime", "Package", "Version"], inst_rows)
+        rpm_rows += inst_rows
+
+    if not dpkg_rows and not apt_rows and not rpm_rows and not dnf_rows:
+        log_warn("PackageHistory: no dpkg/apt/dnf/yum/rpm records found.")
+        return
+    log_success(f"PackageHistory: dpkg={len(dpkg_rows)} apt={len(apt_rows)} rpm/dnf={len(rpm_rows) + len(dnf_rows)} -> {out_dir}")
+
+
+# Persistence
+
+_CRON_LINE_RE = re.compile(r"^(@\w+|(?:\S+\s+){4}\S+)\s+(.*)$")
+
+
+def _lx_iter_cron_jobs(root: Path) -> list[dict[str, str]]:
+    """Every scheduled command across system crontab, cron.d, the periodic
+    run-parts directories, and per-user spool files."""
+    jobs: list[dict[str, str]] = []
+
+    def parse_crontab(path: Path, has_user_field: bool, source: str, user: str = "") -> None:
+        for line in _lx_lines(path):
+            s = line.strip()
+            if not s or s.startswith("#") or re.match(r"^\w+=", s):
+                continue
+            m = _CRON_LINE_RE.match(s)
+            if not m:
+                continue
+            schedule, rest = m.group(1), m.group(2)
+            if has_user_field:
+                parts = rest.split(None, 1)
+                job_user, cmd = (parts[0], parts[1] if len(parts) > 1 else "")
+            else:
+                job_user, cmd = user, rest
+            jobs.append({"Source": source, "File": str(path.relative_to(root)),
+                         "Schedule": re.sub(r"\s+", " ", schedule), "User": job_user, "Command": cmd})
+
+    etc = root / "etc"
+    if (etc / "crontab").is_file():
+        parse_crontab(etc / "crontab", True, "/etc/crontab")
+    if (etc / "cron.d").is_dir():
+        for p in sorted((etc / "cron.d").iterdir()):
+            if p.is_file() and not p.name.startswith("."):
+                parse_crontab(p, True, "/etc/cron.d")
+    for period in ("hourly", "daily", "weekly", "monthly", "yearly"):
+        d = etc / f"cron.{period}"
+        if d.is_dir():
+            for p in sorted(d.iterdir()):
+                if p.is_file() and not p.name.startswith("."):
+                    jobs.append({"Source": f"/etc/cron.{period}", "File": str(p.relative_to(root)),
+                                 "Schedule": period, "User": "root", "Command": f"run-parts script: {p.name}"})
+    for spool in (root / "var" / "spool" / "cron" / "crontabs", root / "var" / "spool" / "cron"):
+        if spool.is_dir():
+            for p in sorted(spool.iterdir()):
+                if p.is_file():
+                    parse_crontab(p, False, "user crontab", user=p.name)
+    return jobs
+
+
+def parse_unix_cron(artifact_paths: PathMap, outdirs: dict[str, Path]) -> None:
+    root = _lx_root(artifact_paths)
+    if not root:
+        log_warn("Cron: [root] not found; skipping.")
+        return
+    out_dir = outdirs["ScheduledTasks"] / "Cron"
+    jobs = _lx_iter_cron_jobs(root)
+    if not jobs:
+        log_warn("Cron: no cron entries found.")
+        return
+    _write_rows_csv(out_dir / "CronJobs.csv", ["Source", "File", "Schedule", "User", "Command"], jobs)
+    log_success(f"Cron: {len(jobs)} job(s) -> {out_dir}")
+
+
+def parse_unix_systemd(artifact_paths: PathMap, outdirs: dict[str, Path]) -> None:
+    root = _lx_root(artifact_paths)
+    live = _lx_live(artifact_paths)
+    out_dir = outdirs["ScheduledTasks"] / "Systemd"
+    tz = _lx_local_tz(artifact_paths)
+    wrote = 0
+
+    if live:
+        rows = []
+        for line in _lx_lines(live / "system" / "systemctl_list-unit-files.txt"):
+            parts = line.split()
+            if len(parts) >= 2 and "." in parts[0] and parts[0] != "UNIT":
+                rows.append({"UnitFile": parts[0], "State": parts[1], "Preset": parts[2] if len(parts) > 2 else ""})
+        if rows:
+            _write_rows_csv(out_dir / "UnitFiles.csv", ["UnitFile", "State", "Preset"], rows)
+            wrote += 1
+
+        rows = []
+        for line in _lx_lines(live / "system" / "systemctl_list-units.txt"):
+            s = line.strip().lstrip("●").strip()
+            parts = s.split(None, 4)
+            if len(parts) >= 4 and "." in parts[0] and parts[0] != "UNIT":
+                rows.append({"Unit": parts[0], "Load": parts[1], "Active": parts[2], "Sub": parts[3],
+                             "Description": parts[4] if len(parts) > 4 else ""})
+        if rows:
+            _write_rows_csv(out_dir / "Units.csv", ["Unit", "Load", "Active", "Sub", "Description"], rows)
+            wrote += 1
+
+        # list-timers: "NEXT LEFT LAST PASSED UNIT ACTIVATES", timestamps like "Tue 2026-09-08 17:53:18 -03".
+        rows = []
+        for line in _lx_lines(live / "system" / "systemctl_list-timers_--all.txt"):
+            m = re.match(r"^(?P<next>\w{3} \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \S+|-|n/a)\s+(?P<left>.*?)\s+"
+                         r"(?P<last>\w{3} \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \S+|-|n/a)\s+(?P<passed>.*?)\s+"
+                         r"(?P<unit>\S+\.timer)\s+(?P<activates>\S+)\s*$", line)
+            if not m:
+                continue
+            rows.append({"Timer": m.group("unit"), "Activates": m.group("activates"),
+                         "NextRun": _lx_systemd_ts(m.group("next")), "LastRun": _lx_systemd_ts(m.group("last"))})
+        if rows:
+            _write_rows_csv(out_dir / "Timers.csv", ["Timer", "Activates", "NextRun", "LastRun"], rows)
+            wrote += 1
+
+    # Unit file contents from the collected filesystem: custom units under
+    # /etc/systemd/system are where persistence is typically dropped.
+    if root:
+        rows = []
+        for base in (root / "etc" / "systemd" / "system", root / "usr" / "lib" / "systemd" / "system",
+                     root / "lib" / "systemd" / "system"):
+            if not base.is_dir():
+                continue
+            for p in sorted(base.rglob("*")):
+                if not p.is_file() or p.suffix not in (".service", ".timer", ".socket", ".path", ".mount"):
+                    continue
+                unit: dict[str, str] = {}
+                for line in _lx_lines(p):
+                    if "=" in line and not line.lstrip().startswith(("#", ";")):
+                        k, v = line.split("=", 1)
+                        k = k.strip()
+                        if k in ("ExecStart", "ExecStartPre", "ExecStartPost", "ExecStop", "User", "WantedBy",
+                                 "Description", "OnCalendar", "OnBootSec", "OnUnitActiveSec", "Type"):
+                            unit[k] = (unit[k] + " ; " if k in unit else "") + v.strip()
+                st = p.stat()
+                rows.append({
+                    "UnitFile": str(p.relative_to(root)), "Description": unit.get("Description", ""),
+                    "ExecStart": unit.get("ExecStart", ""), "ExecStartPre": unit.get("ExecStartPre", ""),
+                    "ExecStop": unit.get("ExecStop", ""), "User": unit.get("User", ""), "Type": unit.get("Type", ""),
+                    "WantedBy": unit.get("WantedBy", ""),
+                    "Schedule": unit.get("OnCalendar", "") or unit.get("OnBootSec", "") or unit.get("OnUnitActiveSec", ""),
+                    "Mtime": _epoch_to_iso(st.st_mtime),
+                })
+        if rows:
+            _write_rows_csv(out_dir / "UnitFileContents.csv",
+                            ["UnitFile", "Description", "ExecStart", "ExecStartPre", "ExecStop", "User", "Type",
+                             "WantedBy", "Schedule", "Mtime"], rows)
+            wrote += 1
+
+        # Per-user autostart/units.
+        rows = []
+        for user, home in _lx_user_homes(root):
+            for rel in ("config/autostart", "config/systemd/user"):
+                d = home / ("." + rel)
+                if d.is_dir():
+                    for p in sorted(d.iterdir()):
+                        if p.is_file():
+                            exec_line = next((l.split("=", 1)[1].strip() for l in _lx_lines(p)
+                                              if l.startswith(("Exec=", "ExecStart="))), "")
+                            rows.append({"User": user, "File": str(p.relative_to(root)), "Exec": exec_line,
+                                         "Mtime": _epoch_to_iso(p.stat().st_mtime)})
+        if rows:
+            _write_rows_csv(out_dir / "UserAutostart.csv", ["User", "File", "Exec", "Mtime"], rows)
+            wrote += 1
+
+    if not wrote:
+        log_warn("Systemd: nothing found.")
+        return
+    log_success(f"Systemd: {wrote} table(s) -> {out_dir}")
+
+
+def _lx_systemd_ts(raw: str) -> str:
+    """'Tue 2026-09-08 17:53:18 -03' -> UTC ISO; '-'/'n/a' -> ''."""
+    raw = raw.strip()
+    if raw in ("-", "n/a", ""):
+        return ""
+    m = re.match(r"^\w{3} (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) ([+-]\d{2})(\d{2})?$", raw)
+    if not m:
+        return raw
+    hours = int(m.group(2))
+    mins = int(m.group(3) or 0) * (-1 if hours < 0 else 1)
+    tz = dt.timezone(dt.timedelta(hours=hours, minutes=mins))
+    return _local_to_utc_iso(dt.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S"), tz)
+
+
+def parse_unix_init_scripts(artifact_paths: PathMap, outdirs: dict[str, Path]) -> None:
+    root = _lx_root(artifact_paths)
+    if not root:
+        log_warn("InitScripts: [root] not found; skipping.")
+        return
+    out_dir = outdirs["ScheduledTasks"] / "InitScripts"
+    rows = []
+    etc = root / "etc"
+    for loc in ("etc/init.d", "etc/rc.d", "usr/local/etc/rc.d"):  # SysV, BSD, BSD ports
+        d = root / loc
+        if d.is_dir():
+            for p in sorted(d.iterdir()):
+                if p.is_file():
+                    rows.append({"Location": "/" + loc, "Name": p.name, "Target": "",
+                                 "Mtime": _epoch_to_iso(p.stat().st_mtime)})
+    seen: set[Path] = set()
+    for rc in sorted(etc.glob("rc*.d")) + sorted((etc / "rc.d").glob("rc*.d")):
+        # RHEL: /etc/rcN.d -> rc.d/rcN.d; a collection may hold the link but not
+        # its target, so is_dir() (follows links) guards against dangling ones.
+        if not rc.is_dir() or rc.resolve() in seen:
+            continue
+        seen.add(rc.resolve())
+        for p in sorted(rc.iterdir()):
+            target = os.readlink(p) if p.is_symlink() else ""
+            rows.append({"Location": "/" + str(rc.relative_to(root)), "Name": p.name, "Target": target,
+                         "Mtime": _epoch_to_iso(p.lstat().st_mtime)})
+    if (etc / "rc.local").is_file():
+        body = " ; ".join(l.strip() for l in _lx_lines(etc / "rc.local") if l.strip() and not l.startswith("#"))
+        rows.append({"Location": "/etc", "Name": "rc.local", "Target": body, "Mtime": _epoch_to_iso((etc / "rc.local").stat().st_mtime)})
+    if not rows:
+        log_warn("InitScripts: nothing found.")
+        return
+    _write_rows_csv(out_dir / "InitScripts.csv", ["Location", "Name", "Target", "Mtime"], rows)
+    log_success(f"InitScripts: {len(rows)} entr(ies) -> {out_dir}")
+
+
+_SHELL_HOOK_FILES = (".bashrc", ".bash_profile", ".bash_login", ".profile", ".bash_logout", ".zshrc", ".zprofile", ".zlogin")
+
+
+def parse_unix_shell_startup(artifact_paths: PathMap, outdirs: dict[str, Path]) -> None:
+    """Shell startup files and ld.so.preload: classic places to hide a command that runs on every login."""
+    root = _lx_root(artifact_paths)
+    if not root:
+        log_warn("ShellStartup: [root] not found; skipping.")
+        return
+    out_dir = outdirs["ScheduledTasks"] / "ShellStartup"
+    rows = []
+
+    def add_file(scope: str, p: Path) -> None:
+        if not p.is_file():
+            return
+        for i, line in enumerate(_lx_lines(p), 1):
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            rows.append({"Scope": scope, "File": str(p.relative_to(root)), "Line": i, "Content": s,
+                         "Mtime": _epoch_to_iso(p.stat().st_mtime)})
+
+    etc = root / "etc"
+    for name in ("profile", "bash.bashrc", "zsh/zshrc", "zsh/zprofile", "ld.so.preload", "rc.local"):
+        add_file("system", etc / name)
+    if (etc / "profile.d").is_dir():
+        for p in sorted((etc / "profile.d").iterdir()):
+            add_file("system", p)
+    for user, home in _lx_user_homes(root):
+        for name in _SHELL_HOOK_FILES:
+            add_file(user, home / name)
+    if not rows:
+        log_warn("ShellStartup: nothing found.")
+        return
+    _write_rows_csv(out_dir / "ShellStartup.csv", ["Scope", "File", "Line", "Content", "Mtime"], rows)
+    log_success(f"ShellStartup: {len(rows)} line(s) -> {out_dir}")
+
+
+def parse_unix_ssh_keys(artifact_paths: PathMap, outdirs: dict[str, Path]) -> None:
+    root = _lx_root(artifact_paths)
+    if not root:
+        log_warn("SSHKeys: [root] not found; skipping.")
+        return
+    out_dir = outdirs["ScheduledTasks"] / "SSHKeys"
+    auth_rows, known_rows = [], []
+    for user, home in _lx_user_homes(root):
+        ssh = home / ".ssh"
+        if not ssh.is_dir():
+            continue
+        for name in ("authorized_keys", "authorized_keys2"):
+            p = ssh / name
+            if p.is_file():
+                for line in _lx_lines(p):
+                    s = line.strip()
+                    if not s or s.startswith("#"):
+                        continue
+                    parts = s.split()
+                    opts, ktype, key, comment = "", "", "", ""
+                    for i, part in enumerate(parts):
+                        if part.startswith(("ssh-", "ecdsa-", "sk-")):
+                            opts = " ".join(parts[:i])
+                            ktype = part
+                            key = parts[i + 1] if i + 1 < len(parts) else ""
+                            comment = " ".join(parts[i + 2:])
+                            break
+                    auth_rows.append({"User": user, "File": str(p.relative_to(root)), "KeyType": ktype,
+                                      "KeyFingerprintTail": key[-24:], "Comment": comment, "Options": opts,
+                                      "Mtime": _epoch_to_iso(p.stat().st_mtime)})
+        p = ssh / "known_hosts"
+        if p.is_file():
+            for line in _lx_lines(p):
+                s = line.strip()
+                if s and not s.startswith("#"):
+                    parts = s.split()
+                    known_rows.append({"User": user, "Host": parts[0], "KeyType": parts[1] if len(parts) > 1 else "",
+                                       "Mtime": _epoch_to_iso(p.stat().st_mtime)})
+    if auth_rows:
+        _write_rows_csv(out_dir / "AuthorizedKeys.csv",
+                        ["User", "File", "KeyType", "KeyFingerprintTail", "Comment", "Options", "Mtime"], auth_rows)
+    if known_rows:
+        _write_rows_csv(out_dir / "KnownHosts.csv", ["User", "Host", "KeyType", "Mtime"], known_rows)
+    if not auth_rows and not known_rows:
+        log_warn("SSHKeys: no .ssh key files found.")
+        return
+    log_success(f"SSHKeys: authorized={len(auth_rows)} known_hosts={len(known_rows)} -> {out_dir}")
+
+
+def parse_unix_launchd(artifact_paths: PathMap, outdirs: dict[str, Path]) -> None:
+    """macOS launchd jobs: system and per-user LaunchAgents/LaunchDaemons plists. Silently produces nothing on other systems."""
+    import plistlib
+    root = _lx_root(artifact_paths)
+    if not root:
+        log_warn("Launchd: [root] not found; skipping.")
+        return
+    out_dir = outdirs["ScheduledTasks"] / "Launchd"
+    dirs = [("system", root / "Library" / "LaunchDaemons"), ("system", root / "Library" / "LaunchAgents"),
+            ("apple", root / "System" / "Library" / "LaunchDaemons"), ("apple", root / "System" / "Library" / "LaunchAgents")]
+    dirs += [(user, home / "Library" / "LaunchAgents") for user, home in _lx_user_homes(root)]
+    rows = []
+    for scope, d in dirs:
+        if not d.is_dir():
+            continue
+        for p in sorted(d.glob("*.plist")):
+            try:
+                with p.open("rb") as fp:
+                    pl = plistlib.load(fp)
+            except Exception:
+                pl = {}
+            args = pl.get("ProgramArguments") or ([pl["Program"]] if pl.get("Program") else [])
+            rows.append({"Scope": scope, "File": str(p.relative_to(root)), "Label": str(pl.get("Label", "")),
+                         "Program": " ".join(str(a) for a in args), "RunAtLoad": str(pl.get("RunAtLoad", "")),
+                         "KeepAlive": str(pl.get("KeepAlive", "")), "StartInterval": str(pl.get("StartInterval", "")),
+                         "Mtime": _epoch_to_iso(p.stat().st_mtime)})
+    if not rows:
+        log_warn("Launchd: no launchd plists found (not macOS?).")
+        return
+    _write_rows_csv(out_dir / "LaunchdJobs.csv",
+                    ["Scope", "File", "Label", "Program", "RunAtLoad", "KeepAlive", "StartInterval", "Mtime"], rows)
+    log_success(f"Launchd: {len(rows)} job(s) -> {out_dir}")
+
+
+def parse_unix_kernel_modules(artifact_paths: PathMap, outdirs: dict[str, Path]) -> None:
+    root = _lx_root(artifact_paths)
+    live = _lx_live(artifact_paths)
+    out_dir = outdirs["ScheduledTasks"] / "KernelModules"
+    rows = []
+    tainting = set()
+    if live:
+        for line in _lx_lines(live / "system" / "modules_tainting_the_kernel_dmesg.txt"):
+            m = re.search(r"module (\S+?)[: ]", line)
+            if m:
+                tainting.add(m.group(1))
+        for line in _lx_lines(live / "system" / "lsmod.txt"):
+            parts = line.split()
+            if len(parts) >= 2 and parts[0] != "Module":
+                rows.append({"Module": parts[0], "Size": parts[1], "UsedBy": " ".join(parts[2:]),
+                             "Source": "lsmod", "Tainting": "True" if parts[0] in tainting else ""})
+    if root:
+        for d in (root / "etc" / "modules-load.d", root / "etc" / "modprobe.d"):
+            if d.is_dir():
+                for p in sorted(d.iterdir()):
+                    if p.is_file():
+                        for line in _lx_lines(p):
+                            s = line.strip()
+                            if s and not s.startswith("#"):
+                                rows.append({"Module": s, "Size": "", "UsedBy": "",
+                                             "Source": str(p.relative_to(root)), "Tainting": ""})
+        p = root / "etc" / "modules"
+        if p.is_file():
+            for line in _lx_lines(p):
+                s = line.strip()
+                if s and not s.startswith("#"):
+                    rows.append({"Module": s, "Size": "", "UsedBy": "", "Source": "etc/modules", "Tainting": ""})
+    if not rows:
+        log_warn("KernelModules: nothing found.")
+        return
+    _write_rows_csv(out_dir / "KernelModules.csv", ["Module", "Size", "UsedBy", "Source", "Tainting"], rows)
+    log_success(f"KernelModules: {len(rows)} entr(ies) -> {out_dir}")
+
+
+# System configuration
+
+def parse_unix_accounts(artifact_paths: PathMap, outdirs: dict[str, Path]) -> None:
+    root = _lx_root(artifact_paths)
+    if not root:
+        log_warn("Accounts: [root] not found; skipping.")
+        return
+    out_dir = outdirs["SystemConfig"] / "Accounts"
+    etc = root / "etc"
+    wrote = 0
+
+    shadow: dict[str, dict[str, str]] = {}
+    for line in _lx_lines(etc / "shadow"):
+        parts = line.split(":")
+        if len(parts) >= 3:
+            h = parts[1]
+            status = "locked/no-login" if h in ("*", "!", "!!", "") or h.startswith("!") else "password set"
+            last_change = ""
+            if parts[2].isdigit() and int(parts[2]) > 0:
+                last_change = (dt.datetime(1970, 1, 1, tzinfo=_UTC) + dt.timedelta(days=int(parts[2]))).strftime("%Y-%m-%d")
+            shadow[parts[0]] = {"status": status, "last_change": last_change, "hash_type": h.split("$")[1] if h.startswith("$") else ""}
+
+    rows = []
+    for line in _lx_lines(etc / "passwd"):
+        parts = line.split(":")
+        if len(parts) >= 7:
+            sh = shadow.get(parts[0], {})
+            rows.append({"User": parts[0], "UID": parts[2], "GID": parts[3], "Gecos": parts[4], "Home": parts[5],
+                         "Shell": parts[6], "PasswordStatus": sh.get("status", ""), "HashType": sh.get("hash_type", ""),
+                         "LastPasswordChangeDate": sh.get("last_change", ""),
+                         "Flag": "UID 0" if parts[2] == "0" and parts[0] != "root" else ""})
+    if rows:
+        _write_rows_csv(out_dir / "Users.csv",
+                        ["User", "UID", "GID", "Gecos", "Home", "Shell", "PasswordStatus", "HashType", "LastPasswordChangeDate", "Flag"], rows)
+        wrote += 1
+
+    rows = []
+    for line in _lx_lines(etc / "group"):
+        parts = line.split(":")
+        if len(parts) >= 4:
+            rows.append({"Group": parts[0], "GID": parts[2], "Members": parts[3]})
+    if rows:
+        _write_rows_csv(out_dir / "Groups.csv", ["Group", "GID", "Members"], rows)
+        wrote += 1
+
+    rows = []
+    sudo_files = [etc / "sudoers"] + (sorted((etc / "sudoers.d").iterdir()) if (etc / "sudoers.d").is_dir() else [])
+    for p in sudo_files:
+        if p.is_file():
+            for line in _lx_lines(p):
+                s = line.strip()
+                if s and not s.startswith("#"):
+                    rows.append({"File": str(p.relative_to(root)), "Rule": s})
+    if rows:
+        _write_rows_csv(out_dir / "Sudoers.csv", ["File", "Rule"], rows)
+        wrote += 1
+
+    rows = []
+    for name in ("sshd_config", "ssh_config"):
+        p = etc / "ssh" / name
+        if p.is_file():
+            for line in _lx_lines(p):
+                s = line.strip()
+                if s and not s.startswith("#"):
+                    k, _, v = s.partition(" ")
+                    rows.append({"File": name, "Option": k, "Value": v.strip()})
+    d = etc / "ssh" / "sshd_config.d"
+    if d.is_dir():
+        for p in sorted(d.iterdir()):
+            if p.is_file():
+                for line in _lx_lines(p):
+                    s = line.strip()
+                    if s and not s.startswith("#"):
+                        k, _, v = s.partition(" ")
+                        rows.append({"File": f"sshd_config.d/{p.name}", "Option": k, "Value": v.strip()})
+    if rows:
+        _write_rows_csv(out_dir / "SSHConfig.csv", ["File", "Option", "Value"], rows)
+        wrote += 1
+
+    if not wrote:
+        log_warn("Accounts: no passwd/group/sudoers found.")
+        return
+    log_success(f"Accounts: {wrote} table(s) -> {out_dir}")
+
+
+def parse_unix_network(artifact_paths: PathMap, outdirs: dict[str, Path]) -> None:
+    root = _lx_root(artifact_paths)
+    live = _lx_live(artifact_paths)
+    out_dir = outdirs["SystemConfig"] / "Network"
+    wrote = 0
+
+    if live:
+        net = live / "network"
+        rows = []
+        iface = ""
+        for line in _lx_lines(net / "ip_addr_show.txt"):
+            m = re.match(r"^\d+:\s+(\S+?):", line)
+            if m:
+                iface = m.group(1)
+            m = re.match(r"\s*(inet6?)\s+(\S+)", line)
+            if m:
+                rows.append({"Interface": iface, "Family": m.group(1), "Address": m.group(2)})
+            m = re.match(r"\s*link/ether\s+(\S+)", line)
+            if m:
+                rows.append({"Interface": iface, "Family": "mac", "Address": m.group(1)})
+        if rows:
+            _write_rows_csv(out_dir / "Interfaces.csv", ["Interface", "Family", "Address"], rows)
+            wrote += 1
+
+        # ss -anp: "Netid State Recv-Q Send-Q Local:Port Peer:Port Process"
+        rows = []
+        for line in _lx_lines(net / "ss_-anp.txt"):
+            parts = line.split()
+            if len(parts) < 6 or parts[0] in ("Netid", "State"):
+                continue
+            netid, state = parts[0], parts[1]
+            if netid == "u_str" or netid.startswith("u_"):
+                continue
+            proc = " ".join(parts[6:]) if len(parts) > 6 else ""
+            pm = re.search(r'\("([^"]+)",pid=(\d+)', proc)
+            rows.append({"Protocol": netid, "State": state, "LocalAddress": parts[4], "PeerAddress": parts[5],
+                         "Process": pm.group(1) if pm else "", "PID": pm.group(2) if pm else ""})
+        if rows:
+            _write_rows_csv(out_dir / "Sockets.csv", ["Protocol", "State", "LocalAddress", "PeerAddress", "Process", "PID"], rows)
+            wrote += 1
+
+        rows = []
+        for line in _lx_lines(net / "arp_-a.txt") + _lx_lines(net / "ip_neighbor_show.txt"):
+            m = re.match(r"^(\S+)\s+dev\s+(\S+)\s+lladdr\s+(\S+)", line) or re.search(r"\(([\d.]+)\) at (\S+) .* on (\S+)", line)
+            if m:
+                g = m.groups()
+                rows.append({"IP": g[0], "MAC": g[2] if "dev" in line else g[1], "Interface": g[1] if "dev" in line else g[2]})
+        if rows:
+            _write_rows_csv(out_dir / "ArpNeighbors.csv", ["IP", "MAC", "Interface"], rows)
+            wrote += 1
+
+        rows = []
+        for fname in ("iptables_-L_-v_-n.txt", "iptables_-t_nat_-L_-v_-n.txt", "ufw_status_verbose.txt"):
+            for line in _lx_lines(net / fname):
+                if line.strip():
+                    rows.append({"Source": fname, "Line": line.rstrip()})
+        if rows:
+            _write_rows_csv(out_dir / "Firewall.csv", ["Source", "Line"], rows)
+            wrote += 1
+
+    if root:
+        rows = []
+        for name in ("hosts", "resolv.conf", "hostname", "nsswitch.conf"):
+            p = root / "etc" / name
+            if p.is_file():
+                for line in _lx_lines(p):
+                    s = line.strip()
+                    if s and not s.startswith("#"):
+                        rows.append({"File": name, "Line": s})
+        if rows:
+            _write_rows_csv(out_dir / "HostsAndResolver.csv", ["File", "Line"], rows)
+            wrote += 1
+
+    if not wrote:
+        log_warn("Network: nothing found.")
+        return
+    log_success(f"Network: {wrote} table(s) -> {out_dir}")
+
+
+def parse_unix_mounts(artifact_paths: PathMap, outdirs: dict[str, Path]) -> None:
+    root = _lx_root(artifact_paths)
+    live = _lx_live(artifact_paths)
+    out_dir = outdirs["SystemConfig"] / "Storage"
+    rows = []
+    if live:
+        for line in _lx_lines(live / "storage" / "mount.txt"):
+            m = re.match(r"^(\S+) on (\S+) type (\S+) \((.*)\)$", line)
+            if m:
+                rows.append({"Source": "mount", "Device": m.group(1), "MountPoint": m.group(2), "Type": m.group(3), "Options": m.group(4)})
+    if root:
+        for line in _lx_lines(root / "etc" / "fstab"):
+            s = line.strip()
+            if s and not s.startswith("#"):
+                parts = s.split()
+                if len(parts) >= 3:
+                    rows.append({"Source": "fstab", "Device": parts[0], "MountPoint": parts[1], "Type": parts[2],
+                                 "Options": parts[3] if len(parts) > 3 else ""})
+    if not rows:
+        log_warn("Storage: nothing found.")
+        return
+    _write_rows_csv(out_dir / "Mounts.csv", ["Source", "Device", "MountPoint", "Type", "Options"], rows)
+    log_success(f"Storage: {len(rows)} mount(s) -> {out_dir}")
+
+
+# User artifacts
+
+_HISTORY_FILES = (".bash_history", ".zsh_history", ".sh_history", ".python_history", ".mysql_history",
+                  ".psql_history", ".sqlite_history", ".lesshst")
+
+
+def parse_unix_shell_history(artifact_paths: PathMap, outdirs: dict[str, Path]) -> None:
+    root = _lx_root(artifact_paths)
+    if not root:
+        log_warn("ShellHistory: [root] not found; skipping.")
+        return
+    out_dir = outdirs["Users"] / "ShellHistory"
+    rows = []
+    for user, home in _lx_user_homes(root):
+        for name in _HISTORY_FILES:
+            p = home / name
+            if not p.is_file():
+                continue
+            pending_ts = ""
+            for i, line in enumerate(_lx_lines(p), 1):
+                # bash HISTTIMEFORMAT / zsh extended history carry the epoch inline.
+                m = re.match(r"^#(\d{9,10})$", line)
+                if m:
+                    pending_ts = _epoch_to_iso(m.group(1))
+                    continue
+                m = re.match(r"^: (\d{9,10}):\d+;(.*)$", line)
+                if m:
+                    pending_ts, line = _epoch_to_iso(m.group(1)), m.group(2)
+                if not line.strip():
+                    continue
+                rows.append({"User": user, "HistoryFile": name, "LineNo": i, "Command": line.rstrip(),
+                             "Timestamp": pending_ts, "FileMtime": _epoch_to_iso(p.stat().st_mtime)})
+                pending_ts = ""
+    if not rows:
+        log_warn("ShellHistory: no history files found.")
+        return
+    _write_rows_csv(out_dir / "ShellHistory.csv", ["User", "HistoryFile", "LineNo", "Command", "Timestamp", "FileMtime"], rows)
+    log_success(f"ShellHistory: {len(rows)} command(s) -> {out_dir}")
+
+
+def parse_unix_recent_files(artifact_paths: PathMap, outdirs: dict[str, Path]) -> None:
+    root = _lx_root(artifact_paths)
+    if not root:
+        log_warn("RecentFiles: [root] not found; skipping.")
+        return
+    out_dir = outdirs["Users"] / "RecentFiles"
+    rows = []
+    for user, home in _lx_user_homes(root):
+        xbel = home / ".local" / "share" / "recently-used.xbel"
+        if xbel.is_file():
+            try:
+                tree = ET.parse(str(xbel))
+                for bm in tree.getroot().iter("bookmark"):
+                    apps = [a.get("name", "") for a in bm.iter("{http://www.freedesktop.org/standards/desktop-bookmarks}application")]
+                    mime = next((m.get("type", "") for m in bm.iter("{http://www.freedesktop.org/standards/shared-mime-info}mime-type")), "")
+                    rows.append({"User": user, "Source": "recently-used.xbel", "Path": bm.get("href", ""),
+                                 "AddedTime": bm.get("added", ""), "ModifiedTime": bm.get("modified", ""), "VisitedTime": bm.get("visited", ""),
+                                 "MimeType": mime, "Applications": ", ".join(apps)})
+            except ET.ParseError as ex:
+                log_warn(f"RecentFiles: could not parse {xbel}: {ex}")
+        viminfo = home / ".viminfo"
+        if viminfo.is_file():
+            mtime = _epoch_to_iso(viminfo.stat().st_mtime)
+            for line in _lx_lines(viminfo):
+                if line.startswith("> "):
+                    rows.append({"User": user, "Source": ".viminfo", "Path": line[2:].strip(), "AddedTime": "", "ModifiedTime": mtime,
+                                 "VisitedTime": "", "MimeType": "", "Applications": "vim"})
+    if not rows:
+        log_warn("RecentFiles: nothing found.")
+        return
+    _write_rows_csv(out_dir / "RecentFiles.csv",
+                    ["User", "Source", "Path", "AddedTime", "ModifiedTime", "VisitedTime", "MimeType", "Applications"], rows)
+    log_success(f"RecentFiles: {len(rows)} entr(ies) -> {out_dir}")
+
+
+def parse_unix_browser_history(artifact_paths: PathMap, outdirs: dict[str, Path]) -> None:
+    """Firefox places.sqlite and Chromium History via stdlib sqlite3."""
+    import sqlite3
+    root = _lx_root(artifact_paths)
+    if not root:
+        log_warn("BrowserHistory: [root] not found; skipping.")
+        return
+    out_dir = outdirs["Users"] / "BrowserHistory"
+    rows = []
+
+    def query(db: Path, sql: str) -> list[tuple]:
+        # Copy first: a collected DB may sit next to a -wal/-shm sqlite would write to.
+        tmp = Path(tempfile.mkdtemp(prefix="triager_db_")) / db.name
+        shutil.copy2(db, tmp)
+        try:
+            conn = sqlite3.connect(f"file:{tmp}?mode=ro", uri=True)
+            try:
+                return conn.execute(sql).fetchall()
+            finally:
+                conn.close()
+        finally:
+            shutil.rmtree(tmp.parent, ignore_errors=True)
+
+    for user, home in _lx_user_homes(root):
+        ff = home / ".mozilla" / "firefox"
+        if ff.is_dir():
+            for db in sorted(ff.rglob("places.sqlite")):
+                try:
+                    for url, title, visit_us in query(db, "SELECT p.url, p.title, v.visit_date FROM moz_historyvisits v "
+                                                         "JOIN moz_places p ON p.id = v.place_id"):
+                        rows.append({"User": user, "Browser": "Firefox", "VisitTime": _epoch_to_iso(visit_us / 1_000_000),
+                                     "URL": url, "Title": title or "", "Profile": db.parent.name})
+                except Exception as ex:
+                    log_warn(f"BrowserHistory: {db}: {ex}")
+        for base, name in ((".config/google-chrome", "Chrome"), (".config/chromium", "Chromium"), (".config/BraveSoftware/Brave-Browser", "Brave")):
+            d = home / base
+            if d.is_dir():
+                for db in sorted(d.rglob("History")):
+                    if not db.is_file():
+                        continue
+                    try:
+                        for url, title, visit_us in query(db, "SELECT u.url, u.title, v.visit_time FROM visits v JOIN urls u ON u.id = v.url"):
+                            # Chromium stores microseconds since 1601-01-01.
+                            rows.append({"User": user, "Browser": name, "VisitTime": _epoch_to_iso(visit_us / 1_000_000 - 11644473600),
+                                         "URL": url, "Title": title or "", "Profile": db.parent.name})
+                    except Exception as ex:
+                        log_warn(f"BrowserHistory: {db}: {ex}")
+    if not rows:
+        log_warn("BrowserHistory: no browser history databases found.")
+        return
+    _write_rows_csv(out_dir / "BrowserHistory.csv", ["User", "Browser", "VisitTime", "URL", "Title", "Profile"], rows)
+    log_success(f"BrowserHistory: {len(rows)} visit(s) -> {out_dir}")
+
+
+# File system artifacts
+
+def parse_unix_bodyfile(artifact_paths: PathMap, outdirs: dict[str, Path]) -> None:
+    """bodyfile v3: MD5|name|inode|mode|uid|gid|size|atime|mtime|ctime|crtime.
+    Streamed row-by-row; these run to hundreds of MB."""
+    src = artifact_paths.get("Bodyfile")
+    if not src or not src.exists():
+        log_warn("Bodyfile: not found; skipping.")
+        return
+    out_dir = outdirs["MFT"] / "Bodyfile"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fields = ["Path", "Inode", "Mode", "UID", "GID", "Size", "Mtime", "Ctime", "Crtime", "Atime", "MD5"]
+    n = 0
+    with src.open("r", encoding="utf-8", errors="replace") as fp, (out_dir / "Bodyfile.csv").open("w", newline="", encoding="utf-8") as out:
+        w = csv.DictWriter(out, fieldnames=fields)
+        w.writeheader()
+        for line in fp:
+            parts = line.rstrip("\n").split("|")
+            if len(parts) < 11:
+                continue
+            w.writerow({"Path": parts[1], "Inode": parts[2], "Mode": parts[3], "UID": parts[4], "GID": parts[5],
+                        "Size": parts[6], "Mtime": _epoch_to_iso(parts[8]), "Ctime": _epoch_to_iso(parts[9]),
+                        "Crtime": _epoch_to_iso(parts[10]), "Atime": _epoch_to_iso(parts[7]),
+                        "MD5": parts[0] if parts[0] != "0" else ""})
+            n += 1
+    log_success(f"Bodyfile: {n} entr(ies) -> {out_dir}")
+
+
+def parse_unix_suspicious_files(artifact_paths: PathMap, outdirs: dict[str, Path]) -> None:
+    """UAC's own findings (suid/sgid, capabilities, world-writable, hidden,
+    sockets, orphaned owners) plus its executable hash lists."""
+    findings = artifact_paths.get("SystemFindings")
+    hashes = artifact_paths.get("HashExecutables")
+    out_dir = outdirs["MFT"] / "SuspiciousFiles"
+    rows = []
+    if findings and findings.is_dir():
+        for p in sorted(findings.iterdir()):
+            if not p.is_file() or p.suffix != ".txt":
+                continue
+            category = p.stem
+            for line in _lx_lines(p):
+                s = line.strip()
+                if not s:
+                    continue
+                if category == "getcap":
+                    path, _, caps = s.partition(" ")
+                    rows.append({"Finding": category, "Path": path, "Detail": caps})
+                else:
+                    rows.append({"Finding": category, "Path": s, "Detail": ""})
+    if rows:
+        _write_rows_csv(out_dir / "Findings.csv", ["Finding", "Path", "Detail"], rows)
+
+    hash_rows = []
+    if hashes and hashes.is_dir():
+        sha1_by_path: dict[str, str] = {}
+        for line in _lx_lines(hashes / "hash_executables.sha1"):
+            m = re.match(r"^([0-9a-f]+)\s+(.+)$", line)
+            if m:
+                sha1_by_path[m.group(2)] = m.group(1)
+        for line in _lx_lines(hashes / "hash_executables.md5"):
+            m = re.match(r"^([0-9a-f]+)\s+(.+)$", line)
+            if m:
+                hash_rows.append({"Path": m.group(2), "MD5": m.group(1), "SHA1": sha1_by_path.get(m.group(2), "")})
+    if hash_rows:
+        _write_rows_csv(out_dir / "ExecutableHashes.csv", ["Path", "MD5", "SHA1"], hash_rows)
+
+    if not rows and not hash_rows:
+        log_warn("SuspiciousFiles: nothing found.")
+        return
+    log_success(f"SuspiciousFiles: findings={len(rows)} hashed_executables={len(hash_rows)} -> {out_dir}")
+
+
+# Event logs
+
+_UNIX_TEXT_LOGS = ("auth.log", "secure", "syslog", "messages", "kern.log", "boot.log", "dmesg", "cron",
+                    "daemon.log", "user.log", "ufw.log", "fail2ban.log", "maillog")
+
+
+def parse_unix_syslogs(artifact_paths: PathMap, outdirs: dict[str, Path]) -> None:
+    root = _lx_root(artifact_paths)
+    if not root:
+        log_warn("SystemLogs: [root] not found; skipping.")
+        return
+    tz = _lx_local_tz(artifact_paths)
+    out_dir = outdirs["Logs"] / "SystemLogs"
+    log_dir = root / "var" / "log"
+    if not log_dir.is_dir():
+        log_warn("SystemLogs: var/log not found.")
+        return
+    total = 0
+    for base in _UNIX_TEXT_LOGS:
+        rows = []
+        for log in sorted(log_dir.glob(f"{base}*")):
+            if not log.is_file() or log.suffix in (".gz", ".xz", ".bz2"):
+                continue
+            mtime = log.stat().st_mtime
+            for line in _lx_lines(log):
+                m = _SYSLOG_RFC_RE.match(line) or _SYSLOG_CLASSIC_RE.match(line)
+                if not m:
+                    continue
+                ts, host, rest = m.groups()
+                pm = re.match(r"^([^\s:\[]+)(?:\[(\d+)\])?:\s?(.*)$", rest)
+                rows.append({"Timestamp": _lx_syslog_ts(ts, tz, mtime), "Host": host,
+                             "Process": pm.group(1) if pm else "", "PID": pm.group(2) or "" if pm else "",
+                             "Message": pm.group(3) if pm else rest, "SourceLog": log.name})
+        if rows:
+            _write_rows_csv(out_dir / f"{base.replace('.', '_')}.csv", ["Timestamp", "Host", "Process", "PID", "Message", "SourceLog"], rows)
+            total += len(rows)
+    if not total:
+        log_warn("SystemLogs: no parseable text logs found.")
+        return
+    log_success(f"SystemLogs: {total} line(s) -> {out_dir}")
+
+
+_LAST_RE = re.compile(
+    r"^(?P<user>\S+)\s+(?P<tty>\S+)\s+(?P<start>\w{3} \w{3}\s+\d+ \d{2}:\d{2}:\d{2} \d{4})\s+"
+    r"(?:-\s+(?P<end>\w{3} \w{3}\s+\d+ \d{2}:\d{2}:\d{2} \d{4})\s+\((?P<dur>[^)]*)\)|(?P<state>still logged in|still running|gone - no logout|down|crash))"
+    r"\s*(?P<host>.*?)\s*$"
+)
+
+
+def parse_unix_logins(artifact_paths: PathMap, outdirs: dict[str, Path]) -> None:
+    live = _lx_live(artifact_paths)
+    if not live:
+        log_warn("Logins: live_response not found; skipping.")
+        return
+    tz = _lx_local_tz(artifact_paths)
+    out_dir = outdirs["Logs"] / "Logins"
+    sysd = live / "system"
+    wrote = 0
+
+    def parse_last(fname: str, kind: str) -> list[dict]:
+        out = []
+        for line in _lx_lines(sysd / fname):
+            m = _LAST_RE.match(line)
+            if not m:
+                continue
+            try:
+                start = _local_to_utc_iso(dt.datetime.strptime(m.group("start"), "%a %b %d %H:%M:%S %Y"), tz)
+            except ValueError:
+                start = m.group("start")
+            end = ""
+            if m.group("end"):
+                try:
+                    end = _local_to_utc_iso(dt.datetime.strptime(m.group("end"), "%a %b %d %H:%M:%S %Y"), tz)
+                except ValueError:
+                    end = m.group("end")
+            out.append({"Type": kind, "User": m.group("user"), "TTY": m.group("tty"), "LoginTime": start, "LogoutTime": end,
+                        "Duration": m.group("dur") or "", "State": m.group("state") or "", "Host": m.group("host")})
+        return out
+
+    rows = parse_last("last_-a_-F.txt", "login") + parse_last("lastb_-a_-F.txt", "failed")
+    if rows:
+        _write_rows_csv(out_dir / "LoginHistory.csv", ["Type", "User", "TTY", "LoginTime", "LogoutTime", "Duration", "State", "Host"], rows)
+        wrote += 1
+
+    rows = []
+    for line in _lx_lines(sysd / "lastlog.txt"):
+        if line.startswith("Username") or not line.strip():
+            continue
+        m = re.match(r"^(\S+)\s+(?:(\S+)\s+)?(?:(\S+)\s+)?(\*\*Never logged in\*\*|\w{3} \w{3}\s+\d+ \d{2}:\d{2}:\d{2} \S+ \d{4})\s*$", line)
+        if not m:
+            continue
+        user, port, frm, latest = m.groups()
+        latest_utc = ""
+        if latest and not latest.startswith("**"):
+            try:
+                naive = dt.datetime.strptime(re.sub(r" [+-]\d{4} ", " ", latest), "%a %b %d %H:%M:%S %Y")
+                latest_utc = _local_to_utc_iso(naive, tz)
+            except ValueError:
+                latest_utc = latest
+        rows.append({"User": user, "Port": port or "", "From": frm or "", "LastLoginTime": latest_utc,
+                     "NeverLoggedIn": "True" if latest.startswith("**") else ""})
+    if rows:
+        _write_rows_csv(out_dir / "Lastlog.csv", ["User", "Port", "From", "LastLoginTime", "NeverLoggedIn"], rows)
+        wrote += 1
+
+    # utmpdump: [type] [pid] [line] [user] [host] [kernel/exit] [addr] [time]
+    rows = []
+    for fname, kind in (("utmpdump_var_log_wtmp.txt", "wtmp"), ("utmpdump_var_log_btmp.txt", "btmp")):
+        for line in _lx_lines(sysd / fname):
+            fields = re.findall(r"\[([^\]]*)\]", line)
+            if len(fields) < 8:
+                continue
+            ts = fields[7].strip().replace(",", ".")
+            try:
+                ts_utc = dt.datetime.fromisoformat(ts).astimezone(_UTC).isoformat()
+            except ValueError:
+                ts_utc = ts
+            rows.append({"Source": kind, "RecordType": fields[0].strip(), "PID": fields[1].strip(), "Line": fields[2].strip(),
+                         "User": fields[3].strip(), "Host": fields[4].strip(), "Address": fields[6].strip(), "Timestamp": ts_utc})
+    if rows:
+        _write_rows_csv(out_dir / "UtmpRecords.csv", ["Source", "RecordType", "PID", "Line", "User", "Host", "Address", "Timestamp"], rows)
+        wrote += 1
+
+    if not wrote:
+        log_warn("Logins: no login records found.")
+        return
+    log_success(f"Logins: {wrote} table(s) -> {out_dir}")
+
+
+_AUDIT_HEAD_RE = re.compile(r"^type=(?P<type>\S+) msg=audit\((?P<epoch>\d+\.\d+):(?P<serial>\d+)\):\s*(?P<body>.*)$")
+_AUDIT_KV_RE = re.compile(r'(\w+)=("(?:[^"\\]|\\.)*"|\S+)')
+_AUDIT_HEX_FIELDS = {"proctitle", "cmd", "comm", "exe", "name", "cwd", "acct", "data"}
+
+
+def _audit_value(key: str, raw: str) -> str:
+    """auditd quotes plain values and hex-encodes ones with special
+    characters (notably proctitle/cmd); decode the latter, NUL -> space."""
+    if raw.startswith('"') and raw.endswith('"'):
+        return raw[1:-1]
+    hexable = key in _AUDIT_HEX_FIELDS or re.fullmatch(r"a\d+(\[\d+\])?", key)  # EXECVE a0..aN
+    if hexable and len(raw) >= 2 and len(raw) % 2 == 0 and re.fullmatch(r"[0-9A-Fa-f]+", raw):
+        try:
+            return bytes.fromhex(raw).decode("utf-8", errors="replace").replace("\x00", " ").strip()
+        except ValueError:
+            pass
+    return raw
+
+
+def parse_unix_auditd(artifact_paths: PathMap, outdirs: dict[str, Path]) -> None:
+    """Linux audit framework (/var/log/audit/audit.log*). One row per
+    record; records sharing a serial are one event (SYSCALL + CWD + PATH +
+    PROCTITLE), so sort/filter on Serial to reassemble."""
+    root = _lx_root(artifact_paths)
+    if not root:
+        log_warn("Auditd: [root] not found; skipping.")
+        return
+    audit_dir = root / "var" / "log" / "audit"
+    logs = [p for p in sorted(audit_dir.glob("audit.log*")) if p.is_file() and p.suffix not in (".gz", ".xz")] if audit_dir.is_dir() else []
+    if not logs:
+        log_warn("Auditd: no audit.log found.")
+        return
+    out_dir = outdirs["Logs"] / "Auditd"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fields = ["Timestamp", "Serial", "Type", "AUID", "UID", "Session", "PID", "PPID", "Exe", "Comm", "Command",
+              "Key", "Result", "Terminal", "Address", "Account", "Hostname", "Message"]
+    n = 0
+    with (out_dir / "AuditLog.csv").open("w", newline="", encoding="utf-8") as out:
+        w = csv.DictWriter(out, fieldnames=fields)
+        w.writeheader()
+        for log in logs:
+            with log.open("r", encoding="utf-8", errors="replace") as fp:
+                for line in fp:
+                    m = _AUDIT_HEAD_RE.match(line.rstrip("\n"))
+                    if not m:
+                        continue
+                    kv = {k: _audit_value(k, v) for k, v in _AUDIT_KV_RE.findall(m.group("body"))}
+                    if m.group("type") == "EXECVE":
+                        args = sorted(((k, v) for k, v in kv.items() if re.fullmatch(r"a\d+", k)), key=lambda t: int(t[0][1:]))
+                        kv["cmd"] = " ".join(v for _, v in args)
+                    w.writerow({
+                        "Timestamp": _epoch_to_iso(m.group("epoch")), "Serial": m.group("serial"), "Type": m.group("type"),
+                        "AUID": kv.get("AUID") or kv.get("auid", ""), "UID": kv.get("UID") or kv.get("uid", ""),
+                        "Session": kv.get("ses", ""), "PID": kv.get("pid", ""), "PPID": kv.get("ppid", ""),
+                        "Exe": kv.get("exe", ""), "Comm": kv.get("comm", ""),
+                        "Command": kv.get("proctitle") or kv.get("cmd", ""), "Key": kv.get("key", ""),
+                        "Result": kv.get("res") or kv.get("success", ""), "Terminal": kv.get("terminal") or kv.get("tty", ""),
+                        "Address": kv.get("addr", ""), "Account": kv.get("acct", ""), "Hostname": kv.get("hostname", ""),
+                        "Message": m.group("body"),
+                    })
+                    n += 1
+    log_success(f"Auditd: {n} record(s) from {len(logs)} file(s) -> {out_dir}")
+
+
+UNIX_PARSER_TOOLS: list[tuple[str, Callable[[PathMap, dict[str, Path]], None]]] = [
+    # Evidence of execution
+    ("Processes", parse_unix_processes),
+    ("SudoCommands", parse_unix_sudo_commands),
+    ("PackageHistory", parse_unix_package_history),
+
+    # Persistence
+    ("Cron", parse_unix_cron),
+    ("Systemd", parse_unix_systemd),
+    ("InitScripts", parse_unix_init_scripts),
+    ("ShellStartup", parse_unix_shell_startup),
+    ("SSHKeys", parse_unix_ssh_keys),
+    ("Launchd", parse_unix_launchd),
+    ("KernelModules", parse_unix_kernel_modules),
+
+    # System configuration
+    ("Accounts", parse_unix_accounts),
+    ("Network", parse_unix_network),
+    ("Storage", parse_unix_mounts),
+
+    # User artifacts
+    ("ShellHistory", parse_unix_shell_history),
+    ("RecentFiles", parse_unix_recent_files),
+    ("BrowserHistory", parse_unix_browser_history),
+
+    # File system artifacts
+    ("SuspiciousFiles", parse_unix_suspicious_files),
+    ("Bodyfile", parse_unix_bodyfile),
+
+    # Logs
+    ("SystemLogs", parse_unix_syslogs),
+    ("Logins", parse_unix_logins),
+    ("Auditd", parse_unix_auditd),
+]
+
+
 PARSER_TOOLS: list[tuple[str, Callable[[PathMap, dict[str, Path]], None]]] = [
     # Evidence of execution
     ("AmCache", parse_amcache),
@@ -2880,8 +4318,9 @@ def run_selected_parsers(
     *,
     workers: int = 0,
     exclude: set[str] | None = None,
+    tools: list[tuple[str, Callable[[PathMap, dict[str, Path]], None]]] | None = None,
 ) -> None:
-    TOOLS = PARSER_TOOLS
+    TOOLS = tools if tools is not None else PARSER_TOOLS
     if exclude:
         excluded_names: list[str] = []
         matched_tokens: set[str] = set()
@@ -3075,23 +4514,30 @@ def find_iocs_in_output_dir(
 
 
 # Extract .ZIP compressed triage
+def _is_tar_archive(path: Path) -> bool:
+    name = path.name.lower()
+    return name.endswith((".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz", ".tar")) or tarfile.is_tarfile(path)
+
+
 def _extract_zip_to_temp(
     zip_path: Path,
     skip_large_files: bool = False,
     max_file_size_bytes: int = 0,
 ) -> Path:
     """
-    Extract ZIP to a unique temp directory and return the extracted root.
-    If skip_large_files is set, any member over max_file_size_bytes is
-    never written to disk (ZipInfo.file_size is free to check up front).
+    Extract a ZIP or tar(.gz/.bz2/.xz) archive to a unique temp directory
+    and return the extracted root. If skip_large_files is set, any member
+    over max_file_size_bytes is never written to disk (member sizes are
+    known up front from the archive index).
     """
 
-    ensure_exists(zip_path, "ZIP file")
+    ensure_exists(zip_path, "Archive file")
     if not zip_path.is_file():
-        raise FileNotFoundError(f"ZIP file not found: {zip_path}")
+        raise FileNotFoundError(f"Archive file not found: {zip_path}")
 
-    if zipfile.is_zipfile(zip_path) is False:
-        raise ValueError(f"Not a valid zip file: {zip_path}")
+    is_tar = _is_tar_archive(zip_path)
+    if not is_tar and zipfile.is_zipfile(zip_path) is False:
+        raise ValueError(f"Not a valid zip or tar archive: {zip_path}")
 
     tmp_root = Path(tempfile.mkdtemp(prefix="triage_zip_")).resolve()
 
@@ -3099,7 +4545,7 @@ def _extract_zip_to_temp(
     illegal = set('<>:"/\\|?*')
     def _sanitize_component(s: str) -> str:
         s = "".join("_" if (c in illegal or ord(c) < 32) else c for c in s)
-        s = s.strip(" .")
+        s = s.rstrip(" .")  # trailing only: leading dots are Unix dotfiles
         return s or "_"
 
     def _safe_join(root: Path, rel: str) -> Path:
@@ -3107,7 +4553,7 @@ def _extract_zip_to_temp(
         rel = rel.replace("\\", "/")
         # Block absolute and traversal
         if rel.startswith("/") or rel.startswith("../") or "/../" in rel:
-            raise ValueError(f"Unsafe zip member path: {rel}")
+            raise ValueError(f"Unsafe archive member path: {rel}")
 
         parts = [p for p in rel.split("/") if p not in ("", ".",)]
         safe_parts = [_sanitize_component(p) for p in parts]
@@ -3130,46 +4576,75 @@ def _extract_zip_to_temp(
     warned = 0
     skipped_large = 0
     skipped_large_bytes = 0
+    skipped_links = 0
 
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        for zi in zf.infolist():
-            raw_name = zi.filename.replace("\\", "/")
-            if raw_name.endswith("/"):
-                continue
-
-            if skip_large_files and max_file_size_bytes and zi.file_size > max_file_size_bytes:
-                skipped_large += 1
-                skipped_large_bytes += zi.file_size
-                log_warn(
-                    f"Skipping large file ({zi.file_size / (1024 * 1024):.1f} MB, "
-                    f"over {max_file_size_bytes / (1024 * 1024):.0f} MB limit): {zi.filename}"
-                )
-                continue
-
-            try:
-                out_path = _safe_join(tmp_root, raw_name)
-                out_path = _truncate_path(out_path)
-
-                # Create parent dirs
-                out_path.parent.mkdir(parents=True, exist_ok=True)
-
-                # Extract by streaming to avoid zipfile path issues
-                with zf.open(zi, "r") as src, out_path.open("wb") as dst:
-                    shutil.copyfileobj(src, dst, length=1024 * 1024)
-
+    def _write_member(raw_name: str, size: int, mtime: float | None, opener) -> None:
+        nonlocal warned, skipped_large, skipped_large_bytes
+        if skip_large_files and max_file_size_bytes and size > max_file_size_bytes:
+            skipped_large += 1
+            skipped_large_bytes += size
+            log_warn(
+                f"Skipping large file ({size / (1024 * 1024):.1f} MB, "
+                f"over {max_file_size_bytes / (1024 * 1024):.0f} MB limit): {raw_name}"
+            )
+            return
+        try:
+            out_path = _truncate_path(_safe_join(tmp_root, raw_name))
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            with opener() as src, out_path.open("wb") as dst:
+                shutil.copyfileobj(src, dst, length=1024 * 1024)
+            if mtime is not None:
                 try:
-                    ts = time.mktime(zi.date_time + (0, 0, -1))
-                    os.utime(out_path, (ts, ts))
+                    os.utime(out_path, (mtime, mtime))
                 except (ValueError, OverflowError, OSError):
                     pass
+        except Exception as ex:
+            warned += 1
+            log_warn(f"Archive extract warning: skipped '{raw_name}': {ex}")
 
-            except Exception as ex:
-                warned += 1
-                log_warn(f"ZIP extract warning: skipped '{zi.filename}': {ex}")
-                continue
+    if is_tar:
+        with tarfile.open(zip_path, "r:*") as tf:
+            for m in tf:
+                raw_name = m.name.replace("\\", "/")
+                if m.isdir():
+                    continue
+                if m.issym() or m.islnk():
+                    if os.name == "nt":
+                        skipped_links += 1
+                        continue
+                    try:
+                        out_path = _truncate_path(_safe_join(tmp_root, raw_name))
+                        out_path.parent.mkdir(parents=True, exist_ok=True)
+                        if not out_path.exists() and not out_path.is_symlink():
+                            os.symlink(m.linkname, out_path)
+                            if m.mtime:
+                                try:
+                                    os.utime(out_path, (m.mtime, m.mtime), follow_symlinks=False)
+                                except (NotImplementedError, OSError):
+                                    pass
+                    except Exception:
+                        skipped_links += 1
+                    continue
+                if not m.isfile():
+                    continue
+                _write_member(raw_name, m.size, float(m.mtime) if m.mtime else None,
+                              lambda m=m: tf.extractfile(m))
+    else:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            for zi in zf.infolist():
+                raw_name = zi.filename.replace("\\", "/")
+                if raw_name.endswith("/"):
+                    continue
+                try:
+                    mtime = time.mktime(zi.date_time + (0, 0, -1))
+                except (ValueError, OverflowError):
+                    mtime = None
+                _write_member(raw_name, zi.file_size, mtime, lambda zi=zi: zf.open(zi, "r"))
 
     if warned:
-        log_warn(f"ZIP extraction completed with {warned} skipped file(s) due to invalid paths/names.")
+        log_warn(f"Archive extraction completed with {warned} skipped file(s) due to invalid paths/names.")
+    if skipped_links:
+        log_warn(f"Skipped {skipped_links} symlink(s) (not recreated on this platform).")
     if skipped_large:
         log_warn(
             f"Skipped {skipped_large} large file(s) ({skipped_large_bytes / (1024 * 1024):.1f} MB total) "
@@ -3239,7 +4714,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "-z",
         "--zip",
-        help="ZIP file containing the triage directory. The ZIP will be extracted to a temp folder for processing.",
+        help="ZIP or tar.gz archive containing the triage collection. Extracted to a temp folder for processing.",
     )
 
     ap.add_argument(
@@ -3450,9 +4925,7 @@ def _print_web_banner(host: str, port: int, https: bool) -> None:
 
 
 def _run_web_mode(args: argparse.Namespace) -> int:
-    """Starts the same FastAPI/uvicorn server as the standalone web app
-    used to, now reachable from this same binary via --web instead of a
-    separate TriagerWeb.exe."""
+    """Starts the FastAPI/uvicorn server."""
     _ensure_web_backend_on_path()
 
     if args.data_dir:
@@ -3517,11 +4990,12 @@ def main() -> int:
     if args.update:
         return run_update()
 
-    if not TOOLS_DIR.exists():
-        log_error(f"Tools directory not found: {TOOLS_DIR}")
-
     if args.list_parsers:
+        print("# Windows (velociraptor / aralez profiles)")
         for name, _ in PARSER_TOOLS:
+            print(name)
+        print("# Linux / Unix (uac profile)")
+        for name, _ in UNIX_PARSER_TOOLS:
             print(name)
         return 0
 
@@ -3591,11 +5065,12 @@ def main() -> int:
 
         ctx = build_paths(cfg)
         triage_root: Path = ctx["root"]
+        platform: str = ctx["platform"]
         artifact_paths: PathMap = ctx["artifact_paths"]
         hive_paths: PathMap = ctx["hive_paths"]
         user_hive_globs: dict[str, str] = ctx["user_hive_globs"]
 
-        outdirs = create_main_dir(output_directory)
+        outdirs = create_main_dir(output_directory, platform)
         meta_dir = outdirs["Meta"]
 
         # Save config snapshot
@@ -3604,6 +5079,7 @@ def main() -> int:
             meta_dir / "paths_resolved.json",
             {
                 "triage_root": str(triage_root),
+                "platform": platform,
                 "artifact_paths": {k: str(v) for k, v in artifact_paths.items()},
                 "hive_paths": {k: str(v) for k, v in hive_paths.items()},
                 "user_hive_globs": user_hive_globs,
@@ -3611,9 +5087,17 @@ def main() -> int:
         )
 
         # Collect host info
-        hp = collect_host_info_from_triage(hive_paths, triage_root, meta_dir, user_hive_globs, artifact_paths)
+        if platform == "unix":
+            hp = collect_unix_host_info(artifact_paths, meta_dir)
+            tools = UNIX_PARSER_TOOLS
+        else:
+            if not TOOLS_DIR.exists():
+                log_error(f"Tools directory not found: {TOOLS_DIR}")
+            hp = collect_host_info_from_triage(hive_paths, triage_root, meta_dir, user_hive_globs, artifact_paths)
+            tools = PARSER_TOOLS
 
         log_info(f"Output: {output_directory}")
+        log_info(f"Platform: {platform}")
         log_info(f"Target: {hp.summary}")
         if hp.operating_system:
             log_info(f"OS: {hp.operating_system}")
@@ -3625,6 +5109,7 @@ def main() -> int:
         run_selected_parsers(
             artifact_paths, outdirs, workers=int(args.workers or 0),
             exclude=_flatten_exclude_parser(args.exclude_parser),
+            tools=tools,
         )
 
         if args.compress:

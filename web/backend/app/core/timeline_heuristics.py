@@ -28,6 +28,9 @@ NAME_EXCLUDE = (
     "sourcecreated", "sourceaccessed",
 
     "linkdate", "drivertimestamp", "exetimestamp",
+    # UAC bodyfile atime
+    "atime",
+    "nextrun",
 )
 
 
