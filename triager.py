@@ -181,7 +181,7 @@ def _ensure_tools_dir() -> Path:
     log_success("Tools extracted. Future runs will start instantly.")
     return target
 
-VERSION = "0.0.2"
+VERSION = "0.0.3"
 USE_COLOR = _supports_color()
 
 UPDATE_REPO = "cristianzsh/triager"
