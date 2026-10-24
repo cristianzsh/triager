@@ -65,7 +65,7 @@ class CaseOut(BaseModel):
 
 class CaseMemberAdd(BaseModel):
     user_id: Optional[str] = None
-    username: Optional[str] = None  # convenience alternative to pasting a raw user_id
+    username: Optional[str] = None # convenience alternative to pasting a raw user_id
     can_edit: bool = True
 
 
@@ -87,7 +87,7 @@ class CaseExportRequest(BaseModel):
 
 # Machines
 class MachineCreate(BaseModel):
-    label: Optional[str] = None  # defaults to "Machine N" if omitted
+    label: Optional[str] = None # defaults to "Machine N" if omitted
 
 
 class MachineOut(BaseModel):
@@ -114,9 +114,9 @@ class MachineOut(BaseModel):
 class IngestRequest(BaseModel):
     upload_id: str
     # What kind of archive was just uploaded.
-    source_kind: str          # "evidence" (raw, needs Triager run) | "processed" (already Triager CSV output)
-    triage_profile: Optional[str] = None   # "velociraptor" | "aralez", required when source_kind == "evidence" and no custom_config_id
-    custom_config_id: Optional[str] = None  # use an uploaded custom config instead of a built-in profile
+    source_kind: str # "evidence" (raw, needs Triager run) | "processed" (already Triager CSV output)
+    triage_profile: Optional[str] = None # "velociraptor" | "aralez", required when source_kind == "evidence" and no custom_config_id
+    custom_config_id: Optional[str] = None # use an uploaded custom config instead of a built-in profile
     workers: int = 0
     skip_large_files: bool = False
     max_file_size_mb: int = 1024
@@ -190,7 +190,7 @@ class FieldCatalogEntry(BaseModel):
 
 # Correlation (case-wide, optionally scoped to specific machines)
 class CorrelationQuery(BaseModel):
-    query: str   # plain term, or a structured query like amcache.column contains x and prefetch.executablename contains x
+    query: str # plain term, or a structured query like amcache.column contains x and prefetch.executablename contains x
     machine_ids: Optional[list[str]] = None
     case_sensitive: bool = False
     max_hits_per_table: int = 500
@@ -214,24 +214,78 @@ class CorrelationResult(BaseModel):
 
 # AI
 class AIAnalysisRequest(BaseModel):
-    conversation_key: str      # opaque per-page id, e.g. "broad:case" or "table:<machine_id>:<table>"
-    provider: str = "custom"   # "claude" (Anthropic API) | "custom" (any OpenAI-compatible endpoint)
-    endpoint: Optional[str] = None   # base URL or full chat/completions URL, required when provider == "custom"
+    conversation_key: str # opaque per-page id, e.g. "broad:case" or "table:<machine_id>:<table>"
+    provider: str = "custom" # "claude" (Anthropic API) | "custom" (any OpenAI-compatible endpoint)
+    endpoint: Optional[str] = None # base URL or full chat/completions URL, required when provider == "custom"
     model: str
-    api_key: Optional[str] = None   # Anthropic API key for provider=="claude"; optional for local custom endpoints
+    api_key: Optional[str] = None # Anthropic API key for provider=="claude"; optional for local custom endpoints
     max_tokens: Optional[int] = None
     question: str
-    machine_id: Optional[str] = None     # restrict context to one machine (None = whole case)
-    tables: Optional[list[str]] = None   # which artifact tables to include as context
-    query: Optional[str] = None          # structured or plain query, same syntax as table search
+    machine_id: Optional[str] = None # restrict context to one machine (None = whole case)
+    tables: Optional[list[str]] = None # which artifact tables to include as context
+    query: Optional[str] = None # structured or plain query, same syntax as table search
     max_rows_per_table: int = 500
-    history_turns: int = 10   # how many prior Q/A pairs from this conversation to include for continuity
+    history_turns: int = 10 # how many prior Q/A pairs from this conversation to include for continuity
+    anonymize: bool = False # mask hostnames/IPs/domains/URLs/users/... with seeded MD5 tokens before sending
+    preview_id: Optional[str] = None # send exactly the request the analyst reviewed via /ask/preview
 
 
 class AIAnalysisResponse(BaseModel):
-    answer: str
+    answer: str # tokens already restored to the real values when anonymize was on
     context_tables_used: list[str]
     truncated: bool
+    anonymized: bool = False
+    anonymization: Optional[dict] = None # values_masked, replacements, by_kind, unrestored_tokens, map_size
+    raw_answer: Optional[str] = None # the answer exactly as the model returned it (tokens intact)
+
+
+class AnonymizationEntry(BaseModel):
+    token: str
+    kind: str
+    original: str
+    created_at: str
+
+
+class AnonymizationMapOut(BaseModel):
+    seed: Optional[str]
+    count: int
+    entries: list[AnonymizationEntry]
+
+
+class AnonymizationCustomIn(BaseModel):
+    value: str
+    kind: str = "TERM"        # TERM | HOST | USER | DOMAIN
+    substring: bool = False   # match inside words too (ACME in ACMEPC01)
+
+
+class AnonymizationCustomOut(BaseModel):
+    id: int
+    value: str
+    kind: str
+    substring: bool
+    created_at: str
+    created_by: Optional[str] = None
+
+
+class AIPreviewEntry(BaseModel):
+    token: str
+    kind: str
+    original: str
+    occurrences: int
+    new: bool
+
+
+class AIPreviewOut(BaseModel):
+    """What an anonymized request would send, for the analyst to confirm."""
+    preview_id: str
+    expires_in_seconds: int
+    question_sent: str
+    context_tables_used: list[str]
+    truncated: bool
+    context_chars: int
+    history_turns: int
+    entries: list[AIPreviewEntry]
+    stats: dict
 
 
 class AIMessageOut(BaseModel):
@@ -271,7 +325,7 @@ class TimelineQuery(BaseModel):
     end: Optional[dt.datetime] = None
     page: int = 1
     page_size: int = 200
-    descending: bool = True  # newest-first by default; old carried-over file timestamps shouldn't dominate the start
+    descending: bool = True # newest-first by default; old carried-over file timestamps shouldn't dominate the start
 
 
 class TimelineEntry(BaseModel):
@@ -296,7 +350,7 @@ class TimelineResult(BaseModel):
 
 # IOC scan
 class IOCScanRequest(BaseModel):
-    iocs_text: str   # one IOC per line, "#" prefix = comment, blank lines ignored (matches Triager's iocs.txt format)
+    iocs_text: str # one IOC per line, "#" prefix = comment, blank lines ignored (matches Triager's iocs.txt format)
     machine_ids: Optional[list[str]] = None
     case_sensitive: bool = False
     max_hits_per_ioc: int = 200

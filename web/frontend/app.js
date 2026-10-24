@@ -51,7 +51,16 @@ function aiRequestBase(cfg) {
     model: cfg.model,
     api_key: cfg.apiKey || null,
     max_tokens: cfg.maxTokens ? Number(cfg.maxTokens) : null,
+    anonymize: !!cfg.anonymize,
   };
+}
+function describeAnonymization(stats) {
+  if (!stats) return "";
+  const kindLabels = { HOST: ["hostname", "hostnames"], IP: ["IP", "IPs"], DOMAIN: ["domain", "domains"], URL: ["URL", "URLs"], EMAIL: ["e-mail", "e-mails"], USER: ["user", "users"], SID: ["SID", "SIDs"], MAC: ["MAC", "MACs"] };
+  const parts = Object.entries(stats.by_kind || {}).sort((a, b) => b[1] - a[1]).map(([k, n]) => `${n} ${(kindLabels[k] || [k, k])[n === 1 ? 0 : 1]}`);
+  let text = `Anonymized: ${stats.values_masked} sensitive value(s) masked before sending${parts.length ? ` (${parts.join(", ")})` : ""}; the answer shown has been restored.`;
+  if (stats.unrestored_tokens) text += ` ${stats.unrestored_tokens} token(s) in the answer did not match the map and were left as-is.`;
+  return text;
 }
 
 // Sanitized with DOMPurify since AI answers can quote strings pulled
@@ -1082,6 +1091,182 @@ function closeModal() {
   if (existing) existing.remove();
 }
 
+const ANON_KIND_OPTIONS = [["TERM", "Term (any sensitive word/phrase)"], ["HOST", "Hostname"], ["USER", "Username / person"], ["DOMAIN", "Domain"]];
+
+async function renderCustomValuesSection(host, { onChange } = {}) {
+  let items = [];
+  try { items = await api(`/cases/${state.currentCase.id}/ai/anonymization/custom`); } catch (_) { items = []; }
+  const editable = !isReadOnly();
+  host.innerHTML = `
+    <div class="anon-custom">
+      <div class="anon-custom-head">Your sensitive values <span class="hint" style="display:inline">-- masked in addition to what is detected automatically</span></div>
+      <div class="anon-custom-list" id="anon-custom-list">
+        ${items.length ? items.map((c) => `
+          <span class="anon-chip" title="${escapeHtml(c.kind)}${c.substring ? ", also inside words" : ""}${c.created_by ? ` -- added by ${escapeHtml(c.created_by)}` : ""}">
+            <span class="anon-kind">${escapeHtml(c.kind)}</span> ${escapeHtml(c.value)}${c.substring ? " <span class=\"anon-chip-sub\">*</span>" : ""}
+            ${editable ? `<button type="button" class="anon-chip-x" data-id="${c.id}" title="Remove">&times;</button>` : ""}
+          </span>`).join("") : `<span class="hint" style="display:inline">None yet.</span>`}
+      </div>
+      ${editable ? `
+      <div class="anon-custom-add">
+        <input type="text" id="anon-custom-value" placeholder="e.g. Acme Corp, PROJECT-X, John Smith" />
+        <select id="anon-custom-kind">${ANON_KIND_OPTIONS.map(([v, l]) => `<option value="${v}">${l}</option>`).join("")}</select>
+        <label class="ai-anon-toggle" title="Also match inside longer words, e.g. ACME in ACMEPC01"><input type="checkbox" id="anon-custom-sub" /> inside words</label>
+        <button type="button" id="anon-custom-add">Add</button>
+      </div>
+      <div class="hint" id="anon-custom-status"></div>` : ""}
+    </div>
+  `;
+  if (!editable) return;
+  const statusEl = host.querySelector("#anon-custom-status");
+  const add = async () => {
+    const value = host.querySelector("#anon-custom-value").value.trim();
+    if (!value) return;
+    try {
+      await api(`/cases/${state.currentCase.id}/ai/anonymization/custom`, {
+        method: "POST",
+        body: { value, kind: host.querySelector("#anon-custom-kind").value, substring: host.querySelector("#anon-custom-sub").checked },
+      });
+    } catch (ex) { statusEl.textContent = ex.message; return; }
+    await renderCustomValuesSection(host, { onChange });
+    if (onChange) await onChange();
+  };
+  host.querySelector("#anon-custom-add").addEventListener("click", add);
+  host.querySelector("#anon-custom-value").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); add(); } });
+  host.querySelectorAll(".anon-chip-x").forEach((btn) => btn.addEventListener("click", async () => {
+    try { await api(`/cases/${state.currentCase.id}/ai/anonymization/custom/${btn.dataset.id}`, { method: "DELETE" }); }
+    catch (ex) { statusEl.textContent = ex.message; return; }
+    await renderCustomValuesSection(host, { onChange });
+    if (onChange) await onChange();
+  }));
+}
+
+function reviewAnonymizedRequest(body) {
+  return new Promise(async (resolve) => {
+    let settled = false;
+    const finish = (v) => { if (!settled) { settled = true; closeModal(); resolve(v); } };
+    let preview;
+    try { preview = await api(`/cases/${state.currentCase.id}/ai/ask/preview`, { method: "POST", body }); }
+    catch (ex) { alert(`Could not prepare the anonymized request: ${ex.message}`); resolve(null); return; }
+
+    showModal("Review before sending", `
+      <p class="hint">Nothing has been sent yet. Every value below is replaced by its token in the evidence, your question and the replayed history. If something sensitive is missing, add it under "Your sensitive values" and the preview refreshes.</p>
+      <div id="anon-review-summary" class="anon-review-summary"></div>
+      <div class="anon-review-question"><div class="ai-turn-label">Question as it will be sent</div><div class="mono" id="anon-review-question"></div></div>
+      <div class="toolbar" style="margin:8px 0">
+        <input id="anon-review-filter" type="text" placeholder="Filter masked values..." style="flex:1" />
+        <button type="button" id="anon-review-download" title="The exact text that would be sent (system prompt, history, context, question)">Download what will be sent</button>
+      </div>
+      <div class="table-scroll" style="max-height:34vh">
+        <table class="data-table anon-table">
+          <thead><tr><th>Kind</th><th>Value</th><th>Token</th><th>Occurrences</th></tr></thead>
+          <tbody id="anon-review-rows"></tbody>
+        </table>
+      </div>
+      <div id="anon-review-custom" style="margin-top:12px"></div>
+      <div class="modal-actions" style="margin-top:14px">
+        <button type="button" class="primary" id="anon-review-send">Send anonymized request</button>
+        <button type="button" id="anon-review-cancel">Cancel</button>
+      </div>
+    `);
+    const overlay = document.getElementById("modal-overlay");
+    overlay.querySelector("#modal-close").addEventListener("click", () => finish(null));
+    overlay.addEventListener("click", (e) => { if (e.target === overlay) finish(null); });
+
+    let rows = [];
+    const renderRows = () => {
+      const f = document.getElementById("anon-review-filter").value.trim().toLowerCase();
+      const shown = rows.filter((r) => !f || r.original.toLowerCase().includes(f) || r.kind.toLowerCase().includes(f) || r.token.toLowerCase().includes(f));
+      document.getElementById("anon-review-rows").innerHTML = shown.length ? shown.map((r) => `
+        <tr>
+          <td><span class="anon-kind">${escapeHtml(r.kind)}</span></td>
+          <td>${escapeHtml(r.original)}${r.new ? ' <span class="anon-new" title="First time this value is mapped in this case">new</span>' : ""}</td>
+          <td class="mono">${escapeHtml(r.token)}</td>
+          <td class="mono">${r.occurrences}</td>
+        </tr>`).join("") : `<tr><td colspan="4" class="hint">${rows.length ? "No entries match." : "Nothing detected as sensitive in this request. Add values below if that is wrong."}</td></tr>`;
+    };
+    const applyPreview = (pv) => {
+      preview = pv;
+      rows = pv.entries || [];
+      const st = pv.stats || {};
+      document.getElementById("anon-review-summary").innerHTML =
+        `<b>${st.values_masked || 0}</b> distinct value(s) masked (${st.replacements || 0} occurrence(s)) across <b>${pv.context_tables_used.length}</b> table(s), ` +
+        `${(pv.context_chars / 1000).toFixed(0)}k characters${pv.history_turns ? `, ${pv.history_turns} earlier turn(s) replayed` : ""}` +
+        `${pv.truncated ? ' <span class="hint" style="display:inline">(context truncated to fit)</span>' : ""}.`;
+      document.getElementById("anon-review-question").textContent = pv.question_sent;
+      renderRows();
+    };
+    applyPreview(preview);
+    document.getElementById("anon-review-filter").addEventListener("input", renderRows);
+    document.getElementById("anon-review-download").addEventListener("click", () =>
+      downloadAuthenticated(`/cases/${state.currentCase.id}/ai/ask/preview/${preview.preview_id}`, `${state.currentCase.name}_ai_request_anonymized.txt`)
+        .catch((ex) => alert(ex.message)));
+    document.getElementById("anon-review-send").addEventListener("click", () => finish(preview.preview_id));
+    document.getElementById("anon-review-cancel").addEventListener("click", () => finish(null));
+
+    await renderCustomValuesSection(document.getElementById("anon-review-custom"), {
+      onChange: async () => {
+        const sendBtn = document.getElementById("anon-review-send");
+        if (!sendBtn) return;
+        sendBtn.disabled = true; sendBtn.textContent = "Refreshing preview...";
+        try { applyPreview(await api(`/cases/${state.currentCase.id}/ai/ask/preview`, { method: "POST", body })); }
+        catch (ex) { alert(`Could not refresh the preview: ${ex.message}`); }
+        finally { sendBtn.disabled = false; sendBtn.textContent = "Send anonymized request"; }
+      },
+    });
+  });
+}
+
+async function showAnonymizationMapModal() {
+  let data;
+  try { data = await api(`/cases/${state.currentCase.id}/ai/anonymization`); }
+  catch (ex) { alert(`Could not load the anonymization map: ${ex.message}`); return; }
+  const rows = data.entries || [];
+  showModal("Anonymization map", `
+    <p class="hint">Each sensitive value found in evidence sent to the AI is replaced by <code>&lt;KIND&gt;_md5(seed + value)</code>. This map (and the per-case seed) lives in the case database, is shared with every analyst on the case, travels with case export, and is used to restore AI answers. Nothing here is ever sent to the model.</p>
+    <div class="toolbar" style="margin:8px 0">
+      <input id="anon-filter" type="text" placeholder="Filter by value, token or kind..." style="flex:1" />
+      <button id="anon-csv" ${rows.length ? "" : "disabled"}>Download CSV</button>
+      ${isReadOnly() ? "" : `<button id="anon-clear" class="danger" ${rows.length ? "" : "disabled"}>Clear map</button>`}
+    </div>
+    <div class="hint" style="margin-bottom:8px">${rows.length} value(s) mapped${data.seed ? ` &middot; seed <code>${escapeHtml(data.seed.slice(0, 8))}&hellip;</code>` : ""}</div>
+    <div class="table-scroll" style="max-height:40vh">
+      <table class="data-table anon-table">
+        <thead><tr><th>Kind</th><th>Original value</th><th>Token</th><th>First seen (UTC)</th></tr></thead>
+        <tbody id="anon-rows">
+          ${rows.length ? "" : `<tr><td colspan="4" class="hint">No values mapped yet. Enable "Anonymize" and ask a question to populate it.</td></tr>`}
+        </tbody>
+      </table>
+    </div>
+    <div id="anon-map-custom" style="margin-top:12px"></div>
+  `);
+  renderCustomValuesSection(document.getElementById("anon-map-custom"));
+  const tbody = document.getElementById("anon-rows");
+  const renderRows = (filter) => {
+    const f = (filter || "").toLowerCase();
+    const shown = rows.filter((r) => !f || r.original.toLowerCase().includes(f) || r.token.toLowerCase().includes(f) || r.kind.toLowerCase().includes(f));
+    tbody.innerHTML = shown.map((r) => `
+      <tr>
+        <td><span class="anon-kind">${escapeHtml(r.kind)}</span></td>
+        <td>${escapeHtml(r.original)}</td>
+        <td class="mono">${escapeHtml(r.token)}</td>
+        <td class="mono">${escapeHtml((r.created_at || "").replace("T", " ").slice(0, 19))}</td>
+      </tr>`).join("") || `<tr><td colspan="4" class="hint">No entries match.</td></tr>`;
+  };
+  if (rows.length) renderRows("");
+  document.getElementById("anon-filter").addEventListener("input", (e) => renderRows(e.target.value));
+  document.getElementById("anon-csv").addEventListener("click", () => {
+    downloadClientCsv(`${state.currentCase.name}_anonymization_map.csv`, ["kind", "original", "token", "created_at"],
+      rows.map((r) => [r.kind, r.original, r.token, r.created_at]));
+  });
+  const clearBtn = document.getElementById("anon-clear");
+  if (clearBtn) clearBtn.addEventListener("click", async () => {
+    if (!confirm("Clear this case's anonymization map and seed? Stored conversations keep their restored text; future anonymized requests will use new tokens.")) return;
+    await api(`/cases/${state.currentCase.id}/ai/anonymization`, { method: "DELETE" });
+    closeModal();
+  });
+}
+
 function showExportCaseModal() {
   showModal("Export case", `
     <p class="hint">Packages this case's metadata, findings, AI conversation history, and full artifact database into a single password-protected file another analyst can import into their own Triager instance. Share the file and the password through separate channels.</p>
@@ -1196,7 +1381,11 @@ async function mountAiConversation(host, { conversationKey, askExtra, templates,
   host.innerHTML = `
     <div class="ai-conv-toolbar">
       <div class="hint">Using ${describeAiConfig(cfg)} -- <a href="#" id="aic-settings-link">change in AI Settings</a></div>
-      <button id="aic-clear">Clear history</button>
+      <div class="ai-conv-tools">
+        <label class="ai-anon-toggle" title="Replace hostnames, IPs, domains, URLs, e-mails, usernames, SIDs and MACs with seeded MD5 tokens before sending; answers are restored from the case's local map."><input type="checkbox" id="aic-anon" ${cfg.anonymize ? "checked" : ""}/> Anonymize</label>
+        <button id="aic-anon-map" title="Token / original value map for this case">Anonymization map</button>
+        <button id="aic-clear">Clear history</button>
+      </div>
     </div>
     ${templates ? `<div class="template-box" id="aic-templates" style="margin-bottom:10px">${templates.map((t, i) => `<button type="button" class="template-btn" data-idx="${i}">${t.label}</button>`).join("")}</div>` : ""}
     <div class="ai-thread" id="aic-thread"></div>
@@ -1206,6 +1395,10 @@ async function mountAiConversation(host, { conversationKey, askExtra, templates,
   `;
 
   document.getElementById("aic-settings-link").addEventListener("click", (e) => { e.preventDefault(); goToAiSettings(); });
+  document.getElementById("aic-anon").addEventListener("change", (e) => {
+    saveAiConfig({ ...loadAiConfig(), anonymize: e.target.checked });
+  });
+  document.getElementById("aic-anon-map").addEventListener("click", showAnonymizationMapModal);
 
   if (templates) {
     document.querySelectorAll("#aic-templates .template-btn").forEach((btn) => {
@@ -1236,12 +1429,14 @@ async function mountAiConversation(host, { conversationKey, askExtra, templates,
     }
     const turn = el(`
       <div class="ai-turn ai-turn-assistant">
-        <div class="ai-turn-label">AI</div>
+        <div class="ai-turn-label">AI${m.rawContent ? ' <span class="ai-anon-flag" title="Sensitive values were masked before sending">anonymized</span>' : ""}</div>
         <div class="ai-answer-rendered">${renderMarkdown(m.content)}</div>
         <div class="ai-turn-actions">
           <button class="copy-md-btn">Copy Markdown</button>
           <button class="copy-rendered-btn">Copy Rendered</button>
+          ${m.rawContent ? '<button class="raw-toggle-btn" title="Switch between the restored answer and the exact text the model returned">Show as received</button>' : ""}
         </div>
+        ${m.anonymization ? `<div class="hint ai-anon-note">${escapeHtml(describeAnonymization(m.anonymization))}</div>` : ""}
       </div>
     `);
     const flashLabel = (btn, label, ok) => {
@@ -1258,6 +1453,15 @@ async function mountAiConversation(host, { conversationKey, askExtra, templates,
       const ok = await copyRichHtml(renderedEl.innerHTML, renderedEl.innerText);
       flashLabel(e.target, "Copy Rendered", ok);
     });
+    const rawBtn = turn.querySelector(".raw-toggle-btn");
+    if (rawBtn) {
+      let showingRaw = false;
+      rawBtn.addEventListener("click", () => {
+        showingRaw = !showingRaw;
+        turn.querySelector(".ai-answer-rendered").innerHTML = renderMarkdown(showingRaw ? m.rawContent : m.content);
+        rawBtn.textContent = showingRaw ? "Show restored" : "Show as received";
+      });
+    }
     return turn;
   }
 
@@ -1307,6 +1511,18 @@ async function mountAiConversation(host, { conversationKey, askExtra, templates,
     const askBtn = document.getElementById("aic-ask");
     const question = questionEl.value.trim();
     if (!question) return;
+    const requestBody = { ...aiRequestBase(cfgNow), conversation_key: conversationKey, question, ...(typeof askExtra === "function" ? askExtra() : askExtra) };
+
+    let previewId = null;
+    if (cfgNow.anonymize && cfgNow.anonymizeConfirm !== false) {
+      askBtn.disabled = true;
+      askBtn.textContent = "Preparing...";
+      statusEl.textContent = "Building the anonymized request for review...";
+      try { previewId = await reviewAnonymizedRequest(requestBody); }
+      finally { askBtn.disabled = false; askBtn.textContent = "Ask"; }
+      if (!previewId) { statusEl.textContent = "Cancelled -- nothing was sent."; return; }
+      requestBody.preview_id = previewId;
+    }
 
     const thread = document.getElementById("aic-thread");
     if (thread.children.length === 1 && thread.children[0].classList.contains("hint")) thread.innerHTML = "";
@@ -1329,11 +1545,12 @@ async function mountAiConversation(host, { conversationKey, askExtra, templates,
     }, 1000);
 
     try {
-      const resp = await api(`/cases/${state.currentCase.id}/ai/ask`, {
-        method: "POST",
-        body: { ...aiRequestBase(cfgNow), conversation_key: conversationKey, question, ...(typeof askExtra === "function" ? askExtra() : askExtra) },
-      });
-      pending.replaceWith(buildTurn({ role: "assistant", content: resp.answer }));
+      const resp = await api(`/cases/${state.currentCase.id}/ai/ask`, { method: "POST", body: requestBody });
+      pending.replaceWith(buildTurn({
+        role: "assistant", content: resp.answer,
+        rawContent: resp.anonymized ? resp.raw_answer : null,
+        anonymization: resp.anonymized ? resp.anonymization : null,
+      }));
       statusEl.textContent = resp.truncated ? "Context was truncated to fit the model." : "";
     } catch (ex) {
       pending.replaceWith(buildTurn({ role: "error", content: ex.message }));
@@ -1773,6 +1990,12 @@ async function renderAiSettingsView() {
         <label>Max tokens (optional)</label>
         <input id="settings-max-tokens" type="number" min="1" value="${cfg.maxTokens || ""}" placeholder="model default" />
       </div>
+      <div class="form-row">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer"><input id="settings-anonymize" type="checkbox" style="width:auto" ${cfg.anonymize ? "checked" : ""}/> Anonymize sensitive values before sending</label>
+        <div class="hint">Hostnames, IP addresses, domains, URLs, e-mail addresses, usernames, SIDs, MAC addresses and any values you flag per case are replaced by <code>&lt;KIND&gt;_md5(seed + value)</code> tokens in everything sent to the model (evidence, your question, replayed history). The token map is kept per case in the local case database, so answers are restored before being shown or stored; "Anonymization map" on any AI panel lists it and holds your own sensitive values. Well-known vendor/update domains (Microsoft, Linux distributions, CAs, package repositories) are left visible so legitimate activity stays recognisable.</div>
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-top:8px"><input id="settings-anonymize-confirm" type="checkbox" style="width:auto" ${cfg.anonymizeConfirm === false ? "" : "checked"}/> Review what will be masked before each request</label>
+        <div class="hint">Shows the masked values for the request about to go out, lets you add missed ones, and sends only after you confirm.</div>
+      </div>
       <button class="primary" id="settings-save">Save</button>
       <div class="hint" id="settings-status"></div>
     </div>
@@ -1794,6 +2017,8 @@ async function renderAiSettingsView() {
       model: document.getElementById("settings-model").value.trim(),
       apiKey: document.getElementById("settings-key").value.trim(),
       maxTokens: document.getElementById("settings-max-tokens").value.trim(),
+      anonymize: document.getElementById("settings-anonymize").checked,
+      anonymizeConfirm: document.getElementById("settings-anonymize-confirm").checked,
     });
     document.getElementById("settings-status").textContent = "Saved.";
   });

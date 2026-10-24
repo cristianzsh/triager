@@ -1,18 +1,27 @@
 import json
+import threading
 import time
+import uuid
+from dataclasses import dataclass, field
 from typing import Optional
 
 import requests
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import PlainTextResponse
 from sqlalchemy.orm import Session
 
 from ..config import settings
 from ..database import get_db
-from ..models import User, Job, JobType, JobStatus, AIMessage
-from ..schemas import AIAnalysisRequest, AIAnalysisResponse, AIMessageOut
+from ..models import User, Job, JobType, JobStatus, AIMessage, Machine
+from ..schemas import (
+    AIAnalysisRequest, AIAnalysisResponse, AIMessageOut, AnonymizationMapOut,
+    AnonymizationCustomIn, AnonymizationCustomOut, AIPreviewOut,
+)
 from ..security import get_current_user, require_case_access
 from ..services.audit import log_event
 from ..services import case_db
+from ..services import anonymizer as anonymization
+from ..services.anonymizer import Anonymizer
 
 # System-level defaults (not case-specific), powers the centralized
 # "AI Settings" screen the frontend uses once for every AI entry point
@@ -158,7 +167,9 @@ def _fit_rows_to_budget(rows: list[dict], budget: int) -> tuple[list[dict], bool
     return rows[:lo], True
 
 
-def _build_context(case_id: str, payload: AIAnalysisRequest, db: Session) -> tuple[str, bool, list[str]]:
+def _build_context(
+    case_id: str, payload: AIAnalysisRequest, db: Session, anonymizer: Optional[Anonymizer] = None,
+) -> tuple[str, bool, list[str]]:
     """Builds the "CASE ARTIFACT CONTEXT: ...\\n\\nQUESTION: ..." text that
     gets sent as the current turn's content."""
     rows_per_table = max(1, min(payload.max_rows_per_table, MAX_ROWS_PER_TABLE_CEILING))
@@ -185,6 +196,8 @@ def _build_context(case_id: str, payload: AIAnalysisRequest, db: Session) -> tup
         share = MAX_CONTEXT_CHARS * (weights[table] / total_weight)
         return int(min(MAX_TABLE_SNIPPET_CHARS, max(_MIN_TABLE_BUDGET_CHARS, share)))
 
+    # Phase 1: fetch + fit every table (and harvest identifiers when masking).
+    prepared = []  # (table, fitted_rows when masking else None, snippet when not masking else None, row_count, row_level_truncated)
     for table in tables:
         try:
             page = case_db.get_table_page(
@@ -194,19 +207,40 @@ def _build_context(case_id: str, payload: AIAnalysisRequest, db: Session) -> tup
             continue
         if not page["rows"]:
             continue  # nothing to show; a header with an empty array wastes budget for zero information
-        meta = table_labels.get(table, {})
-        label = meta.get("table_label") or table
-        machine_label = meta.get("machine_label") or "unknown machine"
         rows = _truncate_long_values(_prune_empty_columns(page["rows"]))
         fitted_rows, row_level_truncated = _fit_rows_to_budget(rows, _budget_for(table))
         if not fitted_rows:
             truncated = True  # doesn't even fit one row (e.g. very wide rows) -- skip the table
             continue
+        if anonymizer:
+            anonymizer.harvest_rows(rows) # all fetched rows, not only the ones that fit: better recall
+            prepared.append((table, fitted_rows, None, len(fitted_rows), row_level_truncated))
+        else:
+            prepared.append((table, None, json.dumps(fitted_rows, ensure_ascii=False), len(fitted_rows), row_level_truncated))
+
+    # Phase 2: mask (tokens are longer than most values they replace, so refit against the table's budget afterwards) and emit.
+    for table, fitted_rows, snippet, row_count, row_level_truncated in prepared:
+        if anonymizer:
+            fitted_rows = anonymizer.anonymize_rows(fitted_rows)
+            snippet = json.dumps(fitted_rows, ensure_ascii=False)
+            budget = _budget_for(table)
+            if len(snippet) > budget * 1.05 and len(fitted_rows) > 1:
+                fitted_rows, refit_truncated = _fit_rows_to_budget(fitted_rows, budget)
+                row_level_truncated = row_level_truncated or refit_truncated
+                snippet = json.dumps(fitted_rows, ensure_ascii=False)
+            row_count = len(fitted_rows)
         if row_level_truncated:
             truncated = True
-        snippet = json.dumps(fitted_rows, ensure_ascii=False)
-        filter_note = f" (filtered by \"{payload.query}\")" if payload.query else ""
-        shown_note = f" -- showing {len(fitted_rows)} of up to {rows_per_table} row(s)" if row_level_truncated else f" -- showing up to {rows_per_table} rows"
+        meta = table_labels.get(table, {})
+        label = meta.get("table_label") or table
+        machine_label = meta.get("machine_label") or "unknown machine"
+        query_note = payload.query or ""
+        if anonymizer:
+            label = anonymizer.anonymize_text(label)
+            machine_label = anonymizer.anonymize_text(machine_label)
+            query_note = anonymizer.anonymize_text(query_note)
+        filter_note = f" (filtered by \"{query_note}\")" if payload.query else ""
+        shown_note = f" -- showing {row_count} of up to {rows_per_table} row(s)" if row_level_truncated else f" -- showing up to {rows_per_table} rows"
         used_tables.append(table)
         context_parts.append(
             f"### Machine: {machine_label} | Table: {label} ({table}){filter_note}{shown_note}\n{snippet}"
@@ -231,35 +265,75 @@ def _build_context(case_id: str, payload: AIAnalysisRequest, db: Session) -> tup
     return context_blob, truncated, included_tables
 
 
-@router.post("/ask", response_model=AIAnalysisResponse)
-def ask_ai(case_id: str, payload: AIAnalysisRequest, request: Request, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    """Builds a context snapshot from the requested (or all) artifact
-    tables and sends it, with the question and recent conversation
-    history, to the specified LLM (local/OpenAI-compatible or Claude).
-    Nothing is sent unless the investigator explicitly triggers this.
+@dataclass
+class PreparedAsk:
+    """Everything that leaves for the model."""
+    case_id: str
+    user_id: str
+    question: str # as typed (stored in the conversation)
+    user_content: str
+    question_sent: str # as sent (masked when anonymizing)
+    history_messages: list[dict]
+    system_prompt: str
+    used_tables: list[str]
+    truncated: bool
+    anonymizer: Optional[Anonymizer]
+    created_at: float = field(default_factory=time.time)
 
-    Scoped by conversation_key (per page) so history persists per scope
-    without mixing between broad/machine/table-level conversations."""
-    require_case_access(case_id, user, db, need_edit=True)
 
+_PREVIEW_TTL_SECONDS = 15 * 60
+_PREVIEW_MAX = 20
+_previews: dict[str, PreparedAsk] = {}
+_previews_lock = threading.Lock()
+
+
+def _store_preview(prepared: PreparedAsk) -> str:
+    preview_id = uuid.uuid4().hex
+    now = time.time()
+    with _previews_lock:
+        for k in [k for k, v in _previews.items() if now - v.created_at > _PREVIEW_TTL_SECONDS]:
+            _previews.pop(k, None)
+        while len(_previews) >= _PREVIEW_MAX:  # oldest out
+            _previews.pop(min(_previews, key=lambda k: _previews[k].created_at), None)
+        _previews[preview_id] = prepared
+    return preview_id
+
+
+def _get_preview(preview_id: str, case_id: str, user_id: str, pop: bool) -> Optional[PreparedAsk]:
+    with _previews_lock:
+        prepared = _previews.get(preview_id)
+        if not prepared or prepared.case_id != case_id or prepared.user_id != user_id:
+            return None
+        if time.time() - prepared.created_at > _PREVIEW_TTL_SECONDS:
+            _previews.pop(preview_id, None)
+            return None
+        if pop:
+            _previews.pop(preview_id, None)
+        return prepared
+
+
+def _validate_provider(payload: AIAnalysisRequest) -> None:
     if payload.provider == "claude":
         if not payload.api_key:
             raise HTTPException(400, "An Anthropic API key is required when using the Claude provider")
     elif not payload.endpoint:
         raise HTTPException(400, "An endpoint is required when using a custom/local LLM provider")
 
-    context_blob, truncated, used_tables = _build_context(case_id, payload, db)
-    user_content = f"CASE ARTIFACT CONTEXT:\n{context_blob}\n\nQUESTION:\n{payload.question}"
 
-    # TEMP DEBUG -- prints the exact payload to the server terminal.
-    #print(f"\n===== AI PAYLOAD (case_id={case_id}, conversation_key={payload.conversation_key}) =====")
-    #print(user_content)
-    #print("===== END AI PAYLOAD =====\n")
+def _prepare_ask(case_id: str, payload: AIAnalysisRequest, db: Session, user: User) -> PreparedAsk:
+    """Context + question + replayed history, masked through the case's
+    seeded token map when anonymize is on (same value, same token across
+    turns)."""
+    anonymizer = None
+    if payload.anonymize:
+        machines = db.query(Machine).filter(Machine.case_id == case_id).all()
+        anonymizer = Anonymizer.for_case(case_id, machines)
 
-    # Prior turns of this same conversation, for continuity. Only the
-    # question/answer text is stored (not the artifact context each turn
-    # sent), so replaying them back doesn't re-bloat every request with
-    # the same rows, only the current question gets fresh context.
+    context_blob, truncated, used_tables = _build_context(case_id, payload, db, anonymizer)
+    question_sent = anonymizer.anonymize_text(payload.question) if anonymizer else payload.question
+    user_content = f"CASE ARTIFACT CONTEXT:\n{context_blob}\n\nQUESTION:\n{question_sent}"
+
+    # Only question/answer text of prior turns is stored
     prior = (
         db.query(AIMessage)
         .filter(AIMessage.case_id == case_id, AIMessage.conversation_key == payload.conversation_key)
@@ -268,7 +342,71 @@ def ask_ai(case_id: str, payload: AIAnalysisRequest, request: Request, db: Sessi
         .all()
     )
     prior = list(reversed(prior))  # oldest first
-    history_messages = [{"role": m.role, "content": m.content} for m in prior]
+    history_messages = [
+        {"role": m.role, "content": anonymizer.anonymize_text(m.content) if anonymizer else m.content}
+        for m in prior
+    ]
+    system_prompt = SYSTEM_PROMPT + (anonymization.PROMPT_SUFFIX if anonymizer else "")
+    return PreparedAsk(
+        case_id=case_id, user_id=user.id, question=payload.question, user_content=user_content, question_sent=question_sent,
+        history_messages=history_messages, system_prompt=system_prompt, used_tables=used_tables,
+        truncated=truncated, anonymizer=anonymizer,
+    )
+
+
+@router.post("/ask/preview", response_model=AIPreviewOut)
+def preview_ask(case_id: str, payload: AIAnalysisRequest, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Builds the anonymized request without sending it and returns what
+    would be masked, so the analyst can confirm (or add missed values and
+    preview again). The prepared request is cached briefly; /ask with the
+    preview_id sends exactly that."""
+    require_case_access(case_id, user, db, need_edit=True)
+    payload.anonymize = True
+    prepared = _prepare_ask(case_id, payload, db, user)
+    preview_id = _store_preview(prepared)
+    anon = prepared.anonymizer
+    return AIPreviewOut(
+        preview_id=preview_id, expires_in_seconds=_PREVIEW_TTL_SECONDS, question_sent=prepared.question_sent,
+        context_tables_used=prepared.used_tables, truncated=prepared.truncated,
+        context_chars=len(prepared.user_content), history_turns=len(prepared.history_messages) // 2,
+        entries=anon.used_entries(), stats=anon.stats(),
+    )
+
+
+@router.get("/ask/preview/{preview_id}", response_class=PlainTextResponse)
+def download_preview(case_id: str, preview_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """The exact text a reviewed request would send (system prompt, replayed
+    history, context and question), for offline inspection."""
+    require_case_access(case_id, user, db)
+    prepared = _get_preview(preview_id, case_id, user.id, pop=False)
+    if not prepared:
+        raise HTTPException(404, "Preview expired or not found; review the request again")
+    parts = [f"=== SYSTEM PROMPT ===\n{prepared.system_prompt}\n"]
+    for m in prepared.history_messages:
+        parts.append(f"=== HISTORY ({m['role']}) ===\n{m['content']}\n")
+    parts.append(f"=== CURRENT TURN (user) ===\n{prepared.user_content}\n")
+    return "\n".join(parts)
+
+
+@router.post("/ask", response_model=AIAnalysisResponse)
+def ask_ai(case_id: str, payload: AIAnalysisRequest, request: Request, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Sends a context snapshot of the requested (or all) artifact tables,
+    the question and recent history to the configured LLM. Scoped by conversation_key
+    so every page keeps its own continuable conversation."""
+    require_case_access(case_id, user, db, need_edit=True)
+    _validate_provider(payload)
+
+    if payload.preview_id:
+        prepared = _get_preview(payload.preview_id, case_id, user.id, pop=True)
+        if not prepared:
+            raise HTTPException(409, "The reviewed request has expired; please review it again")
+    else:
+        prepared = _prepare_ask(case_id, payload, db, user)
+    anonymizer = prepared.anonymizer
+    user_content, history_messages, system_prompt = prepared.user_content, prepared.history_messages, prepared.system_prompt
+    used_tables, truncated = prepared.used_tables, prepared.truncated
+    if anonymizer:
+        anonymizer.persist(case_id)  # kept even if the provider call fails below
 
     job = Job(case_id=case_id, machine_id=payload.machine_id, job_type=JobType.ai_analysis,
               status=JobStatus.running, message=f"Asking model {payload.model}")
@@ -278,9 +416,9 @@ def ask_ai(case_id: str, payload: AIAnalysisRequest, request: Request, db: Sessi
 
     try:
         if payload.provider == "claude":
-            answer = _call_claude(payload.model, payload.api_key, payload.max_tokens, history_messages, user_content)
+            raw_answer = _call_claude(payload.model, payload.api_key, payload.max_tokens, history_messages, user_content, system_prompt)
         else:
-            answer = _call_openai_compatible(payload.endpoint, payload.model, payload.api_key, payload.max_tokens, history_messages, user_content)
+            raw_answer = _call_openai_compatible(payload.endpoint, payload.model, payload.api_key, payload.max_tokens, history_messages, user_content, system_prompt)
     except Exception as ex:  # noqa: BLE001
         job.status = JobStatus.failed
         job.message = f"LLM call failed: {ex}"
@@ -291,22 +429,85 @@ def ask_ai(case_id: str, payload: AIAnalysisRequest, request: Request, db: Sessi
     job.message = "AI analysis complete"
     db.commit()
 
+    stats = None
+    answer = raw_answer
+    if anonymizer:
+        answer, unrestored = anonymizer.restore_text(raw_answer)
+        stats = anonymizer.stats(unrestored)
+
     # Persist this turn (question text only, not the context blob) so the
     # conversation can be replayed/continued next time this page is opened.
-    db.add(AIMessage(case_id=case_id, conversation_key=payload.conversation_key, role="user", content=payload.question))
+    db.add(AIMessage(case_id=case_id, conversation_key=payload.conversation_key, role="user", content=prepared.question))
     db.add(AIMessage(case_id=case_id, conversation_key=payload.conversation_key, role="assistant", content=answer))
     log_event(
         db, user, "ai.ask", case_id=case_id, target_type="conversation", target_id=payload.conversation_key,
         target_label=payload.conversation_key,
         details={
-            "provider": payload.provider, "model": payload.model,
-            "question": payload.question[:500],  # question only, never the answer, keeps the audit log lean
+            "provider": payload.provider, "model": payload.model, "anonymized": bool(anonymizer),
+            "question": prepared.question[:500], # question only, never the answer, keeps the audit log lean
         },
         request=request,
     )
     db.commit()
 
-    return AIAnalysisResponse(answer=answer, context_tables_used=used_tables, truncated=truncated)
+    return AIAnalysisResponse(
+        answer=answer, context_tables_used=used_tables, truncated=truncated,
+        anonymized=bool(anonymizer), anonymization=stats, raw_answer=raw_answer if anonymizer else None,
+    )
+
+
+@router.get("/anonymization", response_model=AnonymizationMapOut)
+def get_anonymization_map(case_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """The case's token -> original map (and seed), kept in case.sqlite so
+    it is shared by every analyst on the case and travels with export."""
+    require_case_access(case_id, user, db)
+    entries = anonymization.load_mapping(case_id)
+    return AnonymizationMapOut(seed=anonymization.load_seed(case_id), count=len(entries), entries=entries)
+
+
+@router.delete("/anonymization")
+def clear_anonymization_map(case_id: str, request: Request, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Forgets the map and seed; stored conversations already hold restored
+    text, so nothing displayed changes. The next anonymized request starts
+    a fresh token namespace."""
+    require_case_access(case_id, user, db, need_edit=True)
+    removed = anonymization.clear_mapping(case_id)
+    log_event(db, user, "ai.anonymization_cleared", case_id=case_id, target_type="case", target_id=case_id,
+              details={"entries_removed": removed}, request=request)
+    db.commit()
+    return {"ok": True, "removed": removed}
+
+
+@router.get("/anonymization/custom", response_model=list[AnonymizationCustomOut])
+def list_custom_values(case_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Analyst-defined sensitive values for this case (company, project,
+    people, anything the heuristics would miss)."""
+    require_case_access(case_id, user, db)
+    return anonymization.list_custom(case_id)
+
+
+@router.post("/anonymization/custom", response_model=AnonymizationCustomOut)
+def add_custom_value(case_id: str, payload: AnonymizationCustomIn, request: Request, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    require_case_access(case_id, user, db, need_edit=True)
+    try:
+        entry = anonymization.add_custom(case_id, payload.value, payload.kind, payload.substring, user.username)
+    except ValueError as ex:
+        raise HTTPException(400, str(ex))
+    log_event(db, user, "ai.anonymization_custom_added", case_id=case_id, target_type="case", target_id=case_id,
+              details={"kind": entry["kind"], "substring": entry["substring"]}, request=request)  # value itself stays out of the audit log
+    db.commit()
+    return entry
+
+
+@router.delete("/anonymization/custom/{custom_id}")
+def delete_custom_value(case_id: str, custom_id: int, request: Request, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    require_case_access(case_id, user, db, need_edit=True)
+    if not anonymization.delete_custom(case_id, custom_id):
+        raise HTTPException(404, "Custom value not found")
+    log_event(db, user, "ai.anonymization_custom_removed", case_id=case_id, target_type="case", target_id=case_id,
+              details={"id": custom_id}, request=request)
+    db.commit()
+    return {"ok": True}
 
 
 _RETRYABLE_STATUSES = {429, 503, 529}
@@ -343,13 +544,13 @@ def _raise_for_status_with_body(resp: requests.Response, provider_name: str) -> 
 
 def _call_openai_compatible(
     endpoint: str, model: str, api_key: Optional[str], max_tokens: Optional[int],
-    history_messages: list[dict], user_content: str,
+    history_messages: list[dict], user_content: str, system_prompt: str = SYSTEM_PROMPT,
 ) -> str:
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages = [{"role": "system", "content": system_prompt}]
     messages.extend(history_messages)
     messages.append({"role": "user", "content": user_content})
 
@@ -375,7 +576,7 @@ def _normalize_openai_endpoint(endpoint: str) -> str:
 
 def _call_claude(
     model: str, api_key: str, max_tokens: Optional[int],
-    history_messages: list[dict], user_content: str,
+    history_messages: list[dict], user_content: str, system_prompt: str = SYSTEM_PROMPT,
 ) -> str:
     """Calls Anthropic's Messages API directly (not an OpenAI-compatible
     shape), x-api-key auth, a required anthropic-version header, and a
@@ -391,7 +592,7 @@ def _call_claude(
     body = {
         "model": model,
         "max_tokens": max_tokens or 4096,
-        "system": SYSTEM_PROMPT,
+        "system": system_prompt,
         "messages": messages,
     }
     resp = _post_with_retry("https://api.anthropic.com/v1/messages", headers=headers, data=json.dumps(body), timeout=300)
