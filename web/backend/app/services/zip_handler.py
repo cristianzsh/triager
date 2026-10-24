@@ -26,7 +26,30 @@ def _safe_join(root: Path, rel: str) -> Path:
         raise ValueError(f"Unsafe zip member path: {rel}")
     parts = [p for p in rel.split("/") if p not in ("", ".")]
     safe_parts = [_sanitize_component(p) for p in parts]
-    return (root / Path(*safe_parts)).resolve()
+    out = (root / Path(*safe_parts)).resolve()
+
+    if out != root and root not in out.parents:
+        raise ValueError(f"Archive member escapes the extraction root: {rel}")
+    return out
+
+
+def _contained_link_target(root: Path, link_path: Path, target: str, hardlink: bool = False) -> Optional[str]:
+    """Target to recreate a tar link with, or None."""
+    t = (target or "").replace("\\", "/")
+    if not t:
+        return None
+    if hardlink:
+        base = root / t.lstrip("/")  # tar hardlink names are archive-relative
+    elif t.startswith("/"):
+        # "/" of the collected system: UAC's "[root]" directory when the link sits under one
+        fs_root = next((a for a in link_path.parents if a.name == "[root]" and (a == root or root in a.parents)), root)
+        base = fs_root / t.lstrip("/")
+    else:
+        base = link_path.parent / t
+    resolved = Path(os.path.normpath(str(base)))
+    if resolved != root and root not in resolved.parents:
+        return None
+    return os.path.relpath(resolved, link_path.parent)
 
 
 def _truncate_path(p: Path, max_name: int = 120) -> Path:
@@ -71,6 +94,7 @@ def extract_zip(
         raise ValueError(f"Not a valid zip or tar archive: {zip_path}")
 
     dest_root.mkdir(parents=True, exist_ok=True)
+    dest_root = dest_root.resolve()
     warned = 0
     skipped_large = 0
     skipped_large_bytes = 0
@@ -111,9 +135,12 @@ def extract_zip(
                     if os.name != "nt":
                         try:
                             out_path = _truncate_path(_safe_join(dest_root, raw_name))
+                            target = _contained_link_target(dest_root, out_path, m.linkname, hardlink=m.islnk())
+                            if target is None:
+                                raise ValueError(f"link target outside the collection: {m.linkname}")
                             out_path.parent.mkdir(parents=True, exist_ok=True)
                             if not out_path.exists() and not out_path.is_symlink():
-                                os.symlink(m.linkname, out_path)
+                                os.symlink(target, out_path)
                                 if m.mtime:
                                     try:
                                         os.utime(out_path, (m.mtime, m.mtime), follow_symlinks=False)

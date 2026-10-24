@@ -657,7 +657,7 @@ def build_paths(cfg: JSONDict) -> JSONDict:
     for hive_name, rel in reg.items():
         hive_paths[hive_name] = (root / str(rel)).resolve()
 
-    user_hive_globs = cfg.get("user_hives", {}) or {}
+    user_hive_globs = cfg.get("UserHives") or cfg.get("user_hives") or {}
     if not isinstance(user_hive_globs, dict):
         raise ValueError("user_hives must be a mapping/dict in config.yml")
 
@@ -916,12 +916,17 @@ def hive_open(path: Path):
     return Registry.Registry(str(path))
 
 
-def _norm_reg_value(v: Any) -> Any:
+def _norm_reg_value(v: Any, value_type: int | None = None) -> Any:
     """
-    Normalize python-registry value data.
+    Normalize python-registry value data. REG_NONE/REG_BINARY stay bytes:
+    latin-1 decodes anything, so the cascade below would turn every blob
+    (BAM/DAM FILETIMEs, MRUListEx) into text.
     """
     if v is None:
         return None
+
+    if isinstance(v, (bytes, bytearray)) and value_type in (0, 3):  # REG_NONE, REG_BINARY
+        return bytes(v)
 
     if isinstance(v, (bytes, bytearray)):
         b = bytes(v)
@@ -947,7 +952,7 @@ def reg_get_value(hive, key_path: str, value_name: str) -> Any | None:
     try:
         k = _open_key(hive, key_path)
         v = k.value(value_name)
-        return _norm_reg_value(v.value())
+        return _norm_reg_value(v.value(), v.value_type())
     except Exception:
         return None
 
@@ -957,7 +962,7 @@ def reg_list_values(hive, key_path: str) -> list[tuple[str, Any]]:
         k = _open_key(hive, key_path)
         out: list[tuple[str, Any]] = []
         for v in k.values():
-            out.append((v.name(), _norm_reg_value(v.value())))
+            out.append((v.name(), _norm_reg_value(v.value(), v.value_type())))
         return out
     except Exception:
         return []
@@ -3083,7 +3088,7 @@ def parse_unix_processes(artifact_paths: PathMap, outdirs: dict[str, Path]) -> N
 
 _SUDO_RE = re.compile(
     r"^(?P<ts>\d{4}-\d{2}-\d{2}T\S+|\w{3}\s+\d+ \d{2}:\d{2}:\d{2})\s+(?P<host>\S+)\s+sudo(?:\[\d+\])?:\s+"
-    r"(?P<user>\S+)\s*:\s*(?:(?P<result>[^;]+?)\s*;\s*)?"
+    r"(?P<user>\S+) ?: ?(?:(?P<result>[^;\s][^;]*?) ?; ?)?"
     r"TTY=(?P<tty>\S+)\s*;\s*PWD=(?P<pwd>.*?)\s*;\s*USER=(?P<target>\S+)\s*;\s*COMMAND=(?P<cmd>.*)$"
 )
 _SYSLOG_CLASSIC_RE = re.compile(r"^(\w{3}\s+\d+ \d{2}:\d{2}:\d{2})\s+(\S+)\s+(.*)$")
@@ -4557,7 +4562,29 @@ def _extract_zip_to_temp(
 
         parts = [p for p in rel.split("/") if p not in ("", ".",)]
         safe_parts = [_sanitize_component(p) for p in parts]
-        return (root / Path(*safe_parts)).resolve()
+        out = (root / Path(*safe_parts)).resolve()
+        # resolve() follows links extracted earlier; the result must stay inside root
+        if out != root and root not in out.parents:
+            raise ValueError(f"Archive member escapes the extraction root: {rel}")
+        return out
+
+    def _contained_link_target(link_path: Path, target: str, hardlink: bool = False) -> str | None:
+        # Absolute targets are re-rooted into the collected filesystem; nothing may point outside tmp_root.
+        t = (target or "").replace("\\", "/")
+        if not t:
+            return None
+        if hardlink:
+            base = tmp_root / t.lstrip("/")  # tar hardlink names are archive-relative
+        elif t.startswith("/"):
+            # "/" of the collected system: UAC's "[root]" directory when the link sits under one
+            fs_root = next((a for a in link_path.parents if a.name == "[root]" and (a == tmp_root or tmp_root in a.parents)), tmp_root)
+            base = fs_root / t.lstrip("/")
+        else:
+            base = link_path.parent / t
+        resolved = Path(os.path.normpath(str(base)))
+        if resolved != tmp_root and tmp_root not in resolved.parents:
+            return None
+        return os.path.relpath(resolved, link_path.parent)
 
     def _truncate_path(p: Path, max_name: int = 120) -> Path:
         """
@@ -4614,9 +4641,13 @@ def _extract_zip_to_temp(
                         continue
                     try:
                         out_path = _truncate_path(_safe_join(tmp_root, raw_name))
+                        target = _contained_link_target(out_path, m.linkname, hardlink=m.islnk())
+                        if target is None:
+                            skipped_links += 1
+                            continue
                         out_path.parent.mkdir(parents=True, exist_ok=True)
                         if not out_path.exists() and not out_path.is_symlink():
-                            os.symlink(m.linkname, out_path)
+                            os.symlink(target, out_path)
                             if m.mtime:
                                 try:
                                     os.utime(out_path, (m.mtime, m.mtime), follow_symlinks=False)
@@ -4644,7 +4675,7 @@ def _extract_zip_to_temp(
     if warned:
         log_warn(f"Archive extraction completed with {warned} skipped file(s) due to invalid paths/names.")
     if skipped_links:
-        log_warn(f"Skipped {skipped_links} symlink(s) (not recreated on this platform).")
+        log_warn(f"Skipped {skipped_links} symlink(s) (target outside the collection, or not recreated on this platform).")
     if skipped_large:
         log_warn(
             f"Skipped {skipped_large} large file(s) ({skipped_large_bytes / (1024 * 1024):.1f} MB total) "
@@ -5093,7 +5124,11 @@ def main() -> int:
         else:
             if not TOOLS_DIR.exists():
                 log_error(f"Tools directory not found: {TOOLS_DIR}")
-            hp = collect_host_info_from_triage(hive_paths, triage_root, meta_dir, user_hive_globs, artifact_paths)
+            try:
+                hp = collect_host_info_from_triage(hive_paths, triage_root, meta_dir, user_hive_globs, artifact_paths)
+            except Exception as ex:  # corrupt/0-byte hive: lose the host profile, keep running the parsers
+                log_error(f"Host profile collection failed ({ex!r}); continuing without it.")
+                hp = HostProfile()
             tools = PARSER_TOOLS
 
         log_info(f"Output: {output_directory}")

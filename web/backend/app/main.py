@@ -13,6 +13,19 @@ from .routers import auth, users, cases, machines, upload, jobs, artifacts, corr
 
 app = FastAPI(title="Triager Web", version="0.1.0")
 
+@app.middleware("http")
+async def _content_security_policy(request, call_next):
+    """The SPA has no inline scripts, so script-src 'self' stops injected
+    markup from executing; img/connect pinned to the console itself."""
+    response = await call_next(request)
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+        "connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
+    )
+    return response
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # tighten in production (reverse proxy / same-origin deployment recommended)
@@ -32,9 +45,9 @@ def on_startup():
 def _warn_if_default_jwt_secret():
     from .config import settings
     if settings.jwt_secret == "CHANGE_ME_IN_PRODUCTION":
-        print("[!] WARNING: TRIAGER_WEB_JWT_SECRET is still the default placeholder.")
-        print("[!] Every login token can be forged by anyone who reads the source.")
-        print("[!] Set a real secret before exposing this beyond your own machine.")
+        import secrets
+        settings.jwt_secret = secrets.token_urlsafe(48)
+        print("[i] TRIAGER_WEB_JWT_SECRET not set: using a random per-process secret (sessions end on restart).")
 
 
 def _bootstrap_admin():

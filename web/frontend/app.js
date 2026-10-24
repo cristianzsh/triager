@@ -576,7 +576,7 @@ function renderCaseSidebar() {
   state.machines.forEach((m) => {
     const item = el(`
       <div class="cat" data-machine="${m.id}">
-        <span>${m.label}${m.hostname ? ` <span class="hint">(${m.hostname})</span>` : ""}</span>
+        <span>${m.label}${m.hostname ? ` <span class="hint">(${escapeHtml(m.hostname)})</span>` : ""}</span>
         <span class="status-pill ${m.status}">${m.status}</span>
       </div>
     `);
@@ -663,7 +663,7 @@ function renderMachinesView() {
     const card = el(`
       <div class="card">
         <div class="title">${m.label}</div>
-        <div class="meta">${m.hostname || "hostname unknown yet"}${m.operating_system ? " &middot; " + m.operating_system : ""}</div>
+        <div class="meta">${m.hostname ? escapeHtml(m.hostname) : "hostname unknown yet"}${m.operating_system ? " &middot; " + escapeHtml(m.operating_system) : ""}</div>
         <div class="meta" style="margin-top:6px"><span class="status-pill ${m.status}">${m.status}</span></div>
         <div style="margin-top:10px">${isReadOnly() ? "" : `<button class="danger delete-machine-btn" data-id="${m.id}">Delete</button>`}</div>
       </div>
@@ -2325,7 +2325,7 @@ async function refreshJobs() {
           <div class="job-type">${job.job_type}</div>
           <span class="status-pill ${job.status}">${job.status}</span>
           <div class="progress-bar"><div class="fill" style="width:${job.progress_pct || 0}%"></div></div>
-          <div class="job-msg">${job.message || ""}</div>
+          <div class="job-msg">${escapeHtml(job.message)}</div>
           <button data-job="${job.id}" class="view-log">${isOpen ? "hide log" : "log"}</button>
         </div>
       `);
@@ -2478,9 +2478,9 @@ function renderAuditTable(events) {
         <tbody>${events.map((e) => `
           <tr>
             <td>${e.created_at.replace("T", " ").replace(/\.\d+Z?$/, "").replace("Z", "")}</td>
-            <td>${e.username || "system"}</td>
-            <td>${e.action}</td>
-            <td>${e.target_label || e.target_id || ""}</td>
+            <td>${escapeHtml(e.username || "system")}</td>
+            <td>${escapeHtml(e.action)}</td>
+            <td>${escapeHtml(e.target_label || e.target_id)}</td>
             <td>${e.details ? escapeHtml(JSON.stringify(e.details)) : ""}</td>
           </tr>
         `).join("")}</tbody>
